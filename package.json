@@ -1,0 +1,60 @@
+{
+  "name": "@brandry/claude-jsonl-compressor",
+  "version": "1.0.0-rc.1",
+  "description": "Strict, model-assisted compression and byte-preserving compatibility repair for one Claude Code JSONL session.",
+  "keywords": [
+    "claude-code",
+    "claude-cli",
+    "jsonl",
+    "context-compression",
+    "context-window",
+    "conversation-memory",
+    "session-transcript",
+    "summarization",
+    "rewind",
+    "model-assisted",
+    "llm",
+    "developer-tools"
+  ],
+  "author": {
+    "name": "Brandry Labs",
+    "url": "https://github.com/brandrylabs"
+  },
+  "type": "commonjs",
+  "license": "GPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/brandrylabs/claude-jsonl-compressor.git"
+  },
+  "homepage": "https://github.com/brandrylabs/claude-jsonl-compressor#readme",
+  "bugs": {
+    "url": "https://github.com/brandrylabs/claude-jsonl-compressor/issues"
+  },
+  "bin": {
+    "claude-jsonl-compressor": "bin/claude-jsonl-compressor.cjs",
+    "claude-jsonl-repair-read-pages": "bin/claude-jsonl-repair-read-pages.cjs"
+  },
+  "files": [
+    "SKILL.md",
+    "CHANGELOG.md",
+    "NOTICE",
+    "agents/*.yaml",
+    "bin/*.cjs",
+    "config/*.json",
+    "references/*.md",
+    "scripts/*.py",
+    "templates/*.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "python -B -m unittest discover -s tests -v"
+  },
+  "publishConfig": {
+    "access": "public",
+    "tag": "rc"
+  }
+}

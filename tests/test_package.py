@@ -24,6 +24,7 @@ PUBLIC_DIR_SUFFIXES = {
     "agents": {".yaml"},
     "bin": {".cjs"},
     "config": {".json"},
+    "docs": {".md"},
     "references": {".md"},
     "scripts": {".py"},
     "templates": {".md"},

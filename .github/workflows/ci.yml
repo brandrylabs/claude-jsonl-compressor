@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: tests (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ['3.10', '3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Report interpreter
+        run: python -VV
+
+      - name: Byte-compile scripts and tests
+        shell: bash
+        run: |
+          pycache="$(mktemp -d)"
+          if ! PYTHONPYCACHEPREFIX="$pycache" python -m compileall -q scripts tests; then
+            rm -rf "$pycache"
+            exit 1
+          fi
+          rm -rf "$pycache"
+
+      - name: Standard-library test suite
+        run: python -B -m unittest discover -s tests -v
+
+      - name: Isolated-interpreter CLI smoke
+        run: |
+          python -B -I -S scripts/compress_claude_jsonl.py --version
+          python -B -I -S scripts/repair_claude_jsonl.py --version
+
+  package:
+    name: npm package checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: npm test
+        run: npm test
+
+      - name: Inspect tarball contents
+        run: npm pack --dry-run --json
+
+      - name: Publish dry run
+        run: npm publish --dry-run --access public --tag rc

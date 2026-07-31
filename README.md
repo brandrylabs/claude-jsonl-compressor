@@ -1,3 +1,9 @@
+<p align="center">
+  <a href="README.md"><img alt="English" src="https://img.shields.io/badge/English-2563eb?style=for-the-badge"></a>
+  <a href="docs/README.zh-CN.md"><img alt="简体中文" src="https://img.shields.io/badge/%E7%AE%80%E4%BD%93%E4%B8%AD%E6%96%87-6b7280?style=for-the-badge"></a>
+  <a href="docs/README.ja.md"><img alt="日本語" src="https://img.shields.io/badge/%E6%97%A5%E6%9C%AC%E8%AA%9E-6b7280?style=for-the-badge"></a>
+</p>
+
 # Claude JSONL Compressor
 
 Strict, model-assisted compression for one Claude Code session transcript, plus an independent byte-preserving compatibility repair for historical `Read.pages` records.

@@ -33,6 +33,7 @@ REPORT_SCHEMA_VERSION = 1
 PRIOR_SUMMARY_VERBATIM_BUDGET_FACTOR = 1.5
 MIN_SUMMARY_CHAR_BUDGET = 4000
 DEFAULT_MODEL_PACK_ESTIMATED_TOKEN_BUDGET = 150000
+MIN_SUPPORTED_PYTHON = (3, 10)
 
 
 def configure_stdio() -> None:
@@ -46,6 +47,29 @@ def configure_stdio() -> None:
 
 
 configure_stdio()
+
+
+def warn_if_python_too_old() -> Optional[str]:
+    """Warn on an unsupported interpreter without blocking the run.
+
+    The documented floor is Python 3.10. Nothing here enforces it, because the
+    modules avoid 3.10-only syntax and may still work on an older interpreter.
+    A caller on an older version gets an explicit heads-up instead of an
+    obscure failure later, but the run is not interrupted.
+    """
+    if sys.version_info >= MIN_SUPPORTED_PYTHON:
+        return None
+    running = ".".join(str(part) for part in sys.version_info[:3])
+    required = ".".join(str(part) for part in MIN_SUPPORTED_PYTHON)
+    message = (
+        f"WARNING: running on Python {running}; this project documents Python {required} or newer. "
+        "Continuing anyway. Unexpected errors may be caused by the interpreter version."
+    )
+    print(message, file=sys.stderr)
+    return message
+
+
+warn_if_python_too_old()
 
 DEFAULT_IMPORTANCE_WORDS = tuple(
 [
@@ -1999,6 +2023,47 @@ def create_backup(path: pathlib.Path, backup_dir: Optional[pathlib.Path] = None)
     return _exclusive_backup_from_bytes(path, path.read_bytes(), backup_dir=backup_dir)
 
 
+def verify_hardlink_support(directory: pathlib.Path) -> None:
+    """Fail before any destructive step if os.link cannot work in `directory`.
+
+    Live replacement publishes the candidate with os.link so that it never
+    clobbers a concurrent claimant, and the rollback path restores the captured
+    original the same way. Both therefore need hard-link support on the target
+    volume. Without this preflight the failure would surface only after the
+    original had already been moved aside, and the rollback would then fail for
+    the same reason, leaving the target absent.
+
+    Filesystems that typically cannot satisfy this: FAT32/exFAT removable
+    media, some SMB/NFS mounts, and some container bind mounts.
+    """
+    probe_source = directory / f".hardlink-probe-{uuid.uuid4().hex}.tmp"
+    probe_link = directory / f".hardlink-probe-{uuid.uuid4().hex}.link.tmp"
+    try:
+        try:
+            probe_source.write_bytes(b"hardlink-probe")
+        except OSError as exc:
+            raise RuntimeError(
+                f"cannot write a probe file next to the replacement target: {exc}"
+            ) from exc
+        try:
+            os.link(probe_source, probe_link)
+        except OSError as exc:
+            raise RuntimeError(
+                "live replacement requires hard-link support on the volume holding "
+                f"{directory}, and this filesystem rejected os.link ({exc}). "
+                "Both candidate publication and rollback depend on it, so the run "
+                "stops now while the target is still untouched. Move the session "
+                "file to a volume that supports hard links (for example NTFS or "
+                "ext4) or use candidate output instead of --replace-original."
+            ) from exc
+    finally:
+        for probe in (probe_link, probe_source):
+            try:
+                probe.unlink()
+            except (FileNotFoundError, OSError):
+                pass
+
+
 def _publish_no_clobber(source_path: pathlib.Path, destination_path: pathlib.Path) -> None:
     """Atomically create destination without replacing any concurrent claimant."""
     if destination_path.exists():
@@ -2075,6 +2140,10 @@ def _replace_file_after_validation(
     source_sha256 = sha256_hex(source_bytes)
     if expected_source_sha256 is not None and source_sha256 != expected_source_sha256:
         raise RuntimeError("input JSONL changed after candidate generation; original file was not replaced")
+    # Preflight before anything is staged, backed up or moved. Publication and
+    # rollback both rely on os.link, so an unsupported volume must stop the run
+    # while the target is still in place.
+    verify_hardlink_support(target_path.parent)
     tmp_replace = target_path.with_name(f".{target_path.name}.replace-{uuid.uuid4().hex}.tmp")
     old_capture = target_path.with_name(f".{target_path.name}.old-{uuid.uuid4().hex}.tmp")
     backup: Optional[pathlib.Path] = None
@@ -2929,6 +2998,10 @@ def choose_resume_leaf_info(
     info: Dict[str, Any] = {
         "ok": False,
         "status": "absent" if last_prompt_entry is None else "unvalidated",
+        # reasonCode is a finer-grained companion to status. Several distinct
+        # rejection paths share one status value, so status alone cannot
+        # identify which check fired; reasonCode is unique per site.
+        "reasonCode": "last-prompt-absent" if last_prompt_entry is None else None,
         "errors": [],
         "warnings": [],
         "lastPromptIndex": last_prompt_entry[0] if last_prompt_entry else None,
@@ -2965,6 +3038,7 @@ def choose_resume_leaf_info(
     }
     if duplicate_uuids:
         info["status"] = "duplicate-uuid"
+        info["reasonCode"] = "duplicate-uuid"
         info["errors"].append(f"duplicate uuid values make resume topology ambiguous: {duplicate_uuids[:20]}")
         return info
     if last_prompt_entry is None:
@@ -2975,6 +3049,7 @@ def choose_resume_leaf_info(
     prompt_leaf = resume_leaf_override or prompt_record.get("leafUuid")
     if not isinstance(prompt_leaf, str) or not prompt_leaf:
         info["status"] = "malformed"
+        info["reasonCode"] = "leaf-uuid-malformed"
         info["errors"].append("authoritative last-prompt leafUuid is missing or malformed")
         return info
     info["selectedLeafUuid"] = prompt_leaf
@@ -2985,14 +3060,17 @@ def choose_resume_leaf_info(
     info["promptChainMalformedParentType"] = trace.get("malformedParentType")
     if trace.get("missingUuid"):
         info["status"] = "dangling"
+        info["reasonCode"] = "chain-missing-uuid"
         info["errors"].append(f"authoritative resume chain references missing uuid: {trace.get('missingUuid')}")
         return info
     if trace.get("loopUuid"):
         info["status"] = "loop"
+        info["reasonCode"] = "chain-loop"
         info["errors"].append(f"authoritative resume chain contains a loop at uuid: {trace.get('loopUuid')}")
         return info
     if trace.get("malformedParentUuid"):
         info["status"] = "malformed-parent"
+        info["reasonCode"] = "chain-malformed-parent"
         info["errors"].append(
             "authoritative resume chain contains a non-null, non-empty-string parentUuid "
             f"on uuid {trace.get('malformedParentUuid')} (type {trace.get('malformedParentType')})"
@@ -3001,6 +3079,7 @@ def choose_resume_leaf_info(
     chain = list(trace.get("chain") or [])
     if not chain:
         info["status"] = "dangling"
+        info["reasonCode"] = "chain-empty"
         info["errors"].append("authoritative resume chain is empty")
         return info
     uuid_to_index = {
@@ -3013,6 +3092,7 @@ def choose_resume_leaf_info(
     info["nonMonotonicCompatibilityEdgeCount"] = order_info["compatibilityEdgeCount"]
     if not order_info["ok"]:
         info["status"] = "non-monotonic"
+        info["reasonCode"] = "chain-non-monotonic"
         info["errors"].append(
             "authoritative resume chain has non-monotonic physical parent edges outside the "
             "same-session attachment compatibility rule"
@@ -3035,6 +3115,7 @@ def choose_resume_leaf_info(
     info["currentSessionId"] = lineage_info["currentSessionId"]
     if not lineage_info["ok"]:
         info["status"] = "session-mismatch"
+        info["reasonCode"] = "lineage-unsafe"
         info["errors"].append(
             "authoritative resume chain has an unsafe sessionId lineage: "
             f"{lineage_info['reason']}"
@@ -3051,6 +3132,7 @@ def choose_resume_leaf_info(
         if extension_pairs:
             if len(extension_pairs) > max_post_prompt_extension:
                 info["status"] = "extension-limit"
+                info["reasonCode"] = "extension-limit-exceeded"
                 info["errors"].append(
                     f"post-last-prompt closure has {len(extension_pairs)} UUID records, exceeding limit {max_post_prompt_extension}"
                 )
@@ -3059,6 +3141,7 @@ def choose_resume_leaf_info(
             expected_session = prompt_record.get("sessionId")
             if not isinstance(expected_session, str) or not expected_session:
                 info["status"] = "session-mismatch"
+                info["reasonCode"] = "extension-authority-session-missing"
                 info["errors"].append("post-last-prompt closure requires a non-empty authority sessionId")
                 return info
             pending_tool_ids = set(tool_use_ids(chain[-1]))
@@ -3066,17 +3149,20 @@ def choose_resume_leaf_info(
             for idx, obj in extension_pairs:
                 if not isinstance(obj.get("uuid"), str) or not obj.get("uuid"):
                     info["status"] = "extension-unsafe"
+                    info["reasonCode"] = "extension-record-missing-uuid"
                     info["errors"].append(
                         f"post-last-prompt record L{idx + 1} has no UUID and breaks the physical closure sequence"
                     )
                     return info
                 if obj.get("parentUuid") != expected_parent:
                     info["status"] = "extension-branch"
+                    info["reasonCode"] = "extension-record-not-linear-descendant"
                     info["errors"].append(f"post-last-prompt record L{idx + 1} is not a direct linear descendant")
                     return info
                 obj_session = obj.get("sessionId")
                 if not isinstance(obj_session, str) or not obj_session or obj_session != expected_session:
                     info["status"] = "session-mismatch"
+                    info["reasonCode"] = "extension-record-session-mismatch"
                     info["errors"].append(
                         f"post-last-prompt record L{idx + 1} does not have the exact authority sessionId"
                     )
@@ -3084,12 +3170,14 @@ def choose_resume_leaf_info(
                 allowed, reason = _allowed_post_prompt_closure(obj, pending_tool_ids)
                 if not allowed:
                     info["status"] = "extension-unsafe"
+                    info["reasonCode"] = "extension-record-not-safe-closure"
                     info["errors"].append(f"post-last-prompt record L{idx + 1} is not a safe closure: {reason}")
                     return info
                 extension_reasons.append(reason)
                 expected_parent = obj.get("uuid")
             if pending_tool_ids:
                 info["status"] = "extension-unsafe"
+                info["reasonCode"] = "extension-pending-tool-ids"
                 info["errors"].append(
                     f"post-last-prompt closure leaves pending tool_use ids unresolved: {sorted(pending_tool_ids)[:20]}"
                 )
@@ -3107,6 +3195,7 @@ def choose_resume_leaf_info(
             info["currentSessionRecordCount"] = int(info.get("currentSessionRecordCount") or 0) + len(extension_pairs)
 
     info["status"] = "valid"
+    info["reasonCode"] = "ok"
     info["ok"] = True
     info["activeChainIndexes"] = chain_indexes
     info["activeChainUuids"] = [obj.get("uuid") for obj in chain]

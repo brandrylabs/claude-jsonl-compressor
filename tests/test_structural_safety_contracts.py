@@ -6,6 +6,7 @@ import contextlib
 import io
 import json
 import pathlib
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -468,6 +469,121 @@ class TestStructuralSafetyContracts(unittest.TestCase):
             observed = (parsed_ack(ccj.parse_args), parsed_ack(rcj.parse_args))
 
         self.assertEqual(observed, (True, True))
+
+    def test_session_listing_survives_a_short_name_root_on_windows(self):
+        """A root written with 8.3 short components must still enumerate.
+
+        The escape guard compares a child against its resolved form. Comparing
+        resolve() with os.path.abspath() rejected every entry when any root
+        component was a short name, because resolve() expands short names and
+        abspath() does not, so the locator found nothing at all.
+        """
+        if sys.platform != "win32":
+            self.skipTest("8.3 short names are a Windows-only path form")
+        import ctypes
+
+        with tempfile.TemporaryDirectory() as raw_dir:
+            long_root = pathlib.Path(raw_dir) / "projects"
+            long_root.mkdir(parents=True)
+            session = long_root / "session-shortname.jsonl"
+            session.write_text(
+                json.dumps({"type": "custom-title", "title": "short name probe"}) + "\n",
+                encoding="utf-8",
+            )
+
+            buffer = ctypes.create_unicode_buffer(1024)
+            written = ctypes.windll.kernel32.GetShortPathNameW(str(long_root), buffer, 1024)
+            if not written:
+                self.skipTest("the filesystem did not provide a short path form")
+            short_root = pathlib.Path(buffer.value)
+            if short_root == long_root:
+                self.skipTest("8.3 short names are disabled on this volume")
+
+            listed = cst.list_session_files(short_root)
+            self.assertEqual(len(listed), 1, f"short-name root enumerated nothing: {short_root}")
+            self.assertEqual(listed[0].resolve(), session.resolve())
+            self.assertEqual(
+                cst.find_unique_session(short_root, "session-shortname").resolve(),
+                session.resolve(),
+            )
+
+    def test_hardlink_preflight_stops_before_touching_the_live_target(self):
+        """os.link is required by both publication and rollback.
+
+        Without a preflight the failure would surface only after the original
+        had been moved aside, and the rollback would then fail for the same
+        reason, leaving the target absent.
+        """
+        record = {
+            "type": "user",
+            "uuid": "11111111-1111-1111-1111-111111111111",
+            "parentUuid": None,
+            "sessionId": "22222222-2222-2222-2222-222222222222",
+            "message": {"role": "user", "content": "hello"},
+        }
+        line = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
+        with tempfile.TemporaryDirectory() as raw_dir:
+            work = pathlib.Path(raw_dir)
+            target = work / "session.jsonl"
+            candidate = work / "candidate.jsonl"
+            target.write_bytes(line)
+            candidate.write_bytes(line)
+            before = target.read_bytes()
+            entries_before = sorted(path.name for path in work.iterdir())
+
+            def refuse_link(_source, _destination):
+                raise OSError(1, "operation not permitted")
+
+            reached_backup = []
+            real_backup = ccj._exclusive_backup_from_bytes
+
+            def spy_backup(*args, **kwargs):
+                reached_backup.append(True)
+                return real_backup(*args, **kwargs)
+
+            with mock.patch.object(ccj.os, "link", refuse_link):
+                with mock.patch.object(ccj, "_exclusive_backup_from_bytes", spy_backup):
+                    with self.assertRaises(RuntimeError) as caught:
+                        ccj._replace_file_after_validation(candidate, target)
+
+            message = str(caught.exception)
+            # The preflight must reject before backup creation is attempted.
+            # Without it the run still fails safely, but only once it reaches
+            # backup publication, and the message is the low-level one that
+            # does not tell the caller what to do about it.
+            self.assertEqual(reached_backup, [], "preflight must run before backup creation")
+            self.assertIn("hard-link support on the volume", message)
+            self.assertIn("still untouched", message)
+            self.assertTrue(target.exists(), "live target must survive the refusal")
+            self.assertEqual(target.read_bytes(), before)
+            self.assertEqual(sorted(path.name for path in work.iterdir()), entries_before)
+
+    def test_hardlink_probe_cleans_up_and_passes_on_a_supported_volume(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            work = pathlib.Path(raw_dir)
+            ccj.verify_hardlink_support(work)
+            self.assertEqual(list(work.iterdir()), [])
+
+    def test_old_python_is_warned_about_but_never_blocked(self):
+        for module in (ccj, cst):
+            with self.subTest(module=module.__name__):
+                stderr = io.StringIO()
+                with mock.patch.object(module, "MIN_SUPPORTED_PYTHON", (99, 0)):
+                    with contextlib.redirect_stderr(stderr):
+                        returned = module.warn_if_python_too_old()
+                self.assertIsNotNone(returned, "an unsupported interpreter must be reported")
+                self.assertIn("WARNING", stderr.getvalue())
+                self.assertIn("Continuing anyway", stderr.getvalue())
+
+    def test_supported_python_produces_no_warning(self):
+        for module in (ccj, cst):
+            with self.subTest(module=module.__name__):
+                stderr = io.StringIO()
+                with mock.patch.object(module, "MIN_SUPPORTED_PYTHON", (3, 0)):
+                    with contextlib.redirect_stderr(stderr):
+                        returned = module.warn_if_python_too_old()
+                self.assertIsNone(returned)
+                self.assertEqual(stderr.getvalue(), "")
 
 
 if __name__ == "__main__":

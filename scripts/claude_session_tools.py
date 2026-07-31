@@ -36,6 +36,25 @@ def eprint(*parts: object) -> None:
 
 configure_stdio()
 
+MIN_SUPPORTED_PYTHON = (3, 10)
+
+
+def warn_if_python_too_old() -> Optional[str]:
+    """Warn on an unsupported interpreter without blocking the run."""
+    if sys.version_info >= MIN_SUPPORTED_PYTHON:
+        return None
+    running = ".".join(str(part) for part in sys.version_info[:3])
+    required = ".".join(str(part) for part in MIN_SUPPORTED_PYTHON)
+    message = (
+        f"WARNING: running on Python {running}; this project documents Python {required} or newer. "
+        "Continuing anyway. Unexpected errors may be caused by the interpreter version."
+    )
+    eprint(message)
+    return message
+
+
+warn_if_python_too_old()
+
 
 def read_jsonl_records(path: pathlib.Path) -> List[Dict[str, Any]]:
     records: List[Dict[str, Any]] = []
@@ -57,13 +76,25 @@ def list_session_files(root: pathlib.Path) -> List[pathlib.Path]:
     found: List[pathlib.Path] = []
     for dir_path, dir_names, file_names in os.walk(root, topdown=True, followlinks=False):
         directory = pathlib.Path(dir_path)
+        # Resolve the containing directory once and compare each child against
+        # `resolved_directory / name`. Comparing child.resolve() against
+        # os.path.abspath(child) instead would reject every entry whenever any
+        # component of the root is a Windows 8.3 short name, because resolve()
+        # expands short names to their long form and abspath() leaves them as
+        # written. A symlink or junction that leaves the directory still
+        # resolves somewhere other than resolved_directory / name, so the
+        # escape guard is unchanged.
+        try:
+            resolved_directory = directory.resolve()
+        except OSError:
+            dir_names[:] = []
+            continue
         safe_dirs: List[str] = []
         for name in dir_names:
             child = directory / name
             try:
                 resolved = child.resolve()
-                lexical = pathlib.Path(os.path.abspath(str(child)))
-                if resolved != lexical or not is_same_or_inside(resolved, root_resolved):
+                if resolved != resolved_directory / name or not is_same_or_inside(resolved, root_resolved):
                     continue
             except OSError:
                 continue
@@ -75,8 +106,7 @@ def list_session_files(root: pathlib.Path) -> List[pathlib.Path]:
             candidate = directory / name
             try:
                 resolved = candidate.resolve()
-                lexical = pathlib.Path(os.path.abspath(str(candidate)))
-                if resolved != lexical or not is_same_or_inside(resolved, root_resolved):
+                if resolved != resolved_directory / name or not is_same_or_inside(resolved, root_resolved):
                     continue
                 if not candidate.is_file():
                     continue

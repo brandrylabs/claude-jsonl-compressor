@@ -97,11 +97,20 @@ Excluded records appear in reports only as counts and digests. Their text is not
 
 ## Requirements
 
-- Python 3.10 or newer
+- Python 3.10 or newer. An older interpreter is reported as a warning at startup and the run continues, because the code avoids 3.10-only syntax; unexpected failures on an older version are not supported.
 - Node.js 22 or newer only when using the npm command wrappers
 - Claude Code is optional; it is needed only for an explicitly requested runtime `/resume` or `/context` smoke test
+- Hard-link support on the volume holding the target file, for `--replace-original` only
 
 No Python package installation is required.
+
+### Hard-link requirement for live replacement
+
+`--replace-original` publishes the candidate with `os.link` so that it never overwrites a concurrent claimant, and the rollback path restores the captured original the same way. Both therefore require hard-link support on the volume holding the session file.
+
+The compressor probes this before it stages, backs up or moves anything. If the filesystem rejects `os.link`, the run stops with the target still in place and nothing written. Filesystems that typically cannot satisfy the requirement include FAT32/exFAT removable media, some SMB/NFS mounts and some container bind mounts. NTFS and ext4 are fine.
+
+Candidate output is unaffected: it publishes through `os.replace` and has no hard-link dependency.
 
 ## Installation
 

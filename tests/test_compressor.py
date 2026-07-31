@@ -24,6 +24,7 @@ import io
 import json
 import pathlib
 import random
+import re
 import tempfile
 import unittest
 from unittest import mock
@@ -1483,6 +1484,7 @@ class TestActiveChain(CompressBase):
         info = ccj.choose_resume_leaf_info(tb.records, max_post_prompt_extension=2)
         self.assertFalse(info["ok"])
         self.assertEqual(info["status"], "extension-unsafe")
+        self.assertEqual(info["reasonCode"], "extension-record-not-safe-closure")
 
     def test_post_pointer_system_record_is_not_a_safe_extension(self):
         tb = fx.build_linear("d5d5d5d5-d5d5-d5d5-d5d5-d5d5d5d5d5d5", turns=30)
@@ -1498,6 +1500,7 @@ class TestActiveChain(CompressBase):
         info = ccj.choose_resume_leaf_info(tb.records, max_post_prompt_extension=1)
         self.assertFalse(info["ok"])
         self.assertEqual(info["status"], "extension-unsafe")
+        self.assertEqual(info["reasonCode"], "extension-record-not-safe-closure")
 
     def test_post_pointer_partial_tool_result_closure_is_rejected(self):
         tb = fx.TranscriptBuilder("d6d6d6d6-d6d6-d6d6-d6d6-d6d6d6d6d6d6")
@@ -1512,7 +1515,65 @@ class TestActiveChain(CompressBase):
         info = ccj.choose_resume_leaf_info(tb.records, max_post_prompt_extension=1)
         self.assertFalse(info["ok"])
         self.assertEqual(info["status"], "extension-unsafe")
+        self.assertEqual(info["reasonCode"], "extension-pending-tool-ids")
         self.assertIn("pending tool_use", " ".join(info["errors"]))
+
+    def test_post_pointer_extension_over_limit_is_rejected(self):
+        # Previously uncovered: no test asserted the extension-limit status.
+        tb = fx.build_linear("d7d7d7d7-d7d7-d7d7-d7d7-d7d7d7d7d7d7", turns=30)
+        pointer_leaf = tb.records[-1]["leafUuid"]
+        parent = pointer_leaf
+        for index in range(3):
+            uid = f"post-limit-{index}"
+            tb.add_raw({
+                "type": "system",
+                "subtype": "hook_response",
+                "uuid": uid,
+                "parentUuid": parent,
+                "sessionId": tb.session_id,
+                "content": "filler",
+            })
+            parent = uid
+        info = ccj.choose_resume_leaf_info(tb.records, max_post_prompt_extension=2)
+        self.assertFalse(info["ok"])
+        self.assertEqual(info["status"], "extension-limit")
+        self.assertEqual(info["reasonCode"], "extension-limit-exceeded")
+
+    def test_post_pointer_non_linear_descendant_is_rejected(self):
+        # Previously uncovered: no test asserted the extension-branch status.
+        tb = fx.build_linear("d8d8d8d8-d8d8-d8d8-d8d8-d8d8d8d8d8d8", turns=30)
+        tb.add_raw({
+            "type": "system",
+            "subtype": "hook_response",
+            "uuid": "post-branch",
+            "parentUuid": "00000000-0000-0000-0000-000000000000",
+            "sessionId": tb.session_id,
+            "content": "not a descendant of the pointer leaf",
+        })
+        info = ccj.choose_resume_leaf_info(tb.records, max_post_prompt_extension=1)
+        self.assertFalse(info["ok"])
+        self.assertEqual(info["status"], "extension-branch")
+        self.assertEqual(info["reasonCode"], "extension-record-not-linear-descendant")
+
+    def test_reason_code_is_unique_per_rejection_site(self):
+        """status is coarse; reasonCode must identify the exact check that fired.
+
+        Three distinct paths share status "extension-unsafe" and three share
+        "session-mismatch", so status alone cannot pin down which check
+        rejected the input.
+        """
+        source = pathlib.Path(ccj.__file__).read_text(encoding="utf-8")
+        start = source.index("def choose_resume_leaf_info(")
+        end = source.index("def require_resume_leaf_info(", start)
+        body = source[start:end]
+        statuses = re.findall(r'info\["status"\] = "([a-z-]+)"', body)
+        codes = re.findall(r'info\["reasonCode"\] = "([a-z-]+)"', body)
+        self.assertEqual(len(statuses), len(codes))
+        self.assertEqual(len(codes), len(set(codes)), "reasonCode values must be unique")
+        self.assertLess(
+            len(set(statuses)), len(set(codes)),
+            "reasonCode must be strictly finer-grained than status",
+        )
 
 
 class TestToolPairing(CompressBase):

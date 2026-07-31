@@ -21,6 +21,7 @@ PUBLIC_ROOT_FILES = {
     ".gitignore", "CHANGELOG.md", "LICENSE", "NOTICE", "README.md", "SKILL.md", "package.json",
 }
 PUBLIC_DIR_SUFFIXES = {
+    ".github": {".yml"},
     "agents": {".yaml"},
     "bin": {".cjs"},
     "config": {".json"},

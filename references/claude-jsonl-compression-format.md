@@ -107,6 +107,39 @@ Strict topology statuses include:
 - `extension-unsafe`
 - `valid`
 
+`status` is the coarse category. `reasonCode` is the stable, machine-readable
+cause. Current producers emit exactly one of these pairs:
+
+| `status` | `reasonCode` | Meaning |
+| --- | --- | --- |
+| `absent` | `last-prompt-absent` | No authoritative `last-prompt` exists |
+| `duplicate-uuid` | `duplicate-uuid` | At least one UUID is ambiguous |
+| `malformed` | `leaf-uuid-malformed` | The authoritative `leafUuid` is absent, empty or not a string |
+| `dangling` | `chain-missing-uuid` | The selected chain references an unknown UUID |
+| `loop` | `chain-loop` | The selected chain contains a parent loop |
+| `malformed-parent` | `chain-malformed-parent` | A selected record has an invalid non-null `parentUuid` |
+| `dangling` | `chain-empty` | Defensive outcome when tracing returns no chain and no more specific error |
+| `non-monotonic` | `chain-non-monotonic` | Physical parent order violates the accepted compatibility rule |
+| `session-mismatch` | `lineage-unsafe` | Session ancestry is not an accepted one-way lineage |
+| `extension-limit` | `extension-limit-exceeded` | Post-pointer records exceed the explicit closure limit |
+| `session-mismatch` | `extension-authority-session-missing` | A requested closure has no usable authority session |
+| `extension-unsafe` | `extension-record-missing-uuid` | A closure record has no usable UUID |
+| `extension-branch` | `extension-record-not-linear-descendant` | A closure record is not the next direct child |
+| `session-mismatch` | `extension-record-session-mismatch` | A closure record does not match the authority session |
+| `extension-unsafe` | `extension-record-not-safe-closure` | A closure record is not a tool-result-only safe closure |
+| `extension-unsafe` | `extension-pending-tool-ids` | The requested closure leaves tool calls unresolved |
+| `valid` | `ok` | Strict topology validation succeeded |
+
+For `lineage-unsafe`, `lineageReason` carries the lower-level lineage diagnosis.
+Human-readable `errors` text is diagnostic and is not an enum. Normal
+compression/model-pack/repair failures also include `reasonCode=<value>` in the
+raised CLI error.
+
+Report-schema v1 objects and `compactMetadata` are open, additive objects:
+consumers must ignore unknown fields. Stable producers include `reasonCode` on
+every strict topology result. A pre-stable v1 artifact may lack it; readers
+should treat that as legacy/unknown rather than infer `ok`.
+
 `--resume-leaf UUID` is an explicit recovery override. It is reported as
 `active-chain-manual-override`, distinct from default strict `active-chain`.
 `--preserve-physical-tail` is a separate legacy compatibility
@@ -175,7 +208,7 @@ The engine emits exactly one current Codex-created compact pair:
 Simplified synthetic shape:
 
 ```json
-{"type":"system","subtype":"compact_boundary","uuid":"BOUNDARY_UUID","parentUuid":null,"compactMetadata":{"codexOfflineCompression":true,"codexOfflineCompressionVersion":"v10","modelPackSchemaVersion":11,"reportSchemaVersion":1,"summaryUuid":"SUMMARY_UUID","preserveMode":"active-chain","resumeLeafInfo":{"status":"valid","selectedLeafUuid":"ACTIVE_LEAF"}}}
+{"type":"system","subtype":"compact_boundary","uuid":"BOUNDARY_UUID","parentUuid":null,"compactMetadata":{"codexOfflineCompression":true,"codexOfflineCompressionVersion":"v10","modelPackSchemaVersion":11,"reportSchemaVersion":1,"summaryUuid":"SUMMARY_UUID","preserveMode":"active-chain","resumeLeafInfo":{"status":"valid","reasonCode":"ok","selectedLeafUuid":"ACTIVE_LEAF"}}}
 {"type":"user","uuid":"SUMMARY_UUID","parentUuid":"BOUNDARY_UUID","isCompactSummary":true,"message":{"role":"user","content":"SUMMARY_TEXT"}}
 ```
 

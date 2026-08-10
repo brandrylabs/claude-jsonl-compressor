@@ -73,6 +73,10 @@ python "$skill\scripts\compress_claude_jsonl.py" `
   --analyze-resume-path
 ```
 
+Use `reasonCode` as the exact machine-readable outcome and `status` only as its
+coarse category. The stable pairs are documented in
+`references/claude-jsonl-compression-format.md`.
+
 Strict active mode stops before writing any pack, candidate, sidecar or backup when the authority is absent, malformed, dangling, cyclic, has unsafe/recurring session lineage, has ordinary-message physical parent inversion, contains a malformed `parentUuid`, or is UUID-ambiguous.
 
 After partitioning, run the shared validator on the authoritative logical active chain plus its projected pointer. Old malformed tool exchanges, duplicate tool IDs, or compact-pair metadata on that chain must stop before semantic evidence generation; damage confined to excluded inactive branches remains excluded and does not become summary text.

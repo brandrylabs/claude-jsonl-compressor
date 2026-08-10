@@ -214,7 +214,9 @@ python "$skill\scripts\compress_claude_jsonl.py" `
   --analyze-resume-path
 ```
 
-这一步是只读的。非零结果必须先解决，然后才能生成模型包。
+这一步是只读的。非零结果必须先解决，然后才能生成模型包。精确且适合程序读取的原因请看
+`reasonCode`；`status` 只是粗略分类。稳定值表见
+[`references/claude-jsonl-compression-format.md`](../references/claude-jsonl-compression-format.md#authoritative-last-prompt)。
 
 ### 2. 生成模型证据包
 
@@ -597,4 +599,3 @@ tests/
 ## 许可证
 
 GPL-3.0-only。你可以在 GPL 条款下使用、研究、修改和再分发本项目。分发修改版或包含本项目的版本，可能需要一并提供相应源码并采用相同许可证；将其集成进对外分发的商业产品时，请先查阅许可证。
-

@@ -47,6 +47,7 @@ def configure_stdio() -> None:
 
 configure_stdio()
 
+
 DEFAULT_IMPORTANCE_WORDS = tuple(
 [
     "must",
@@ -1999,6 +2000,55 @@ def create_backup(path: pathlib.Path, backup_dir: Optional[pathlib.Path] = None)
     return _exclusive_backup_from_bytes(path, path.read_bytes(), backup_dir=backup_dir)
 
 
+def verify_hardlink_support(directory: pathlib.Path) -> None:
+    """Fail before any destructive step if os.link cannot work in `directory`.
+
+    Live replacement publishes the candidate with os.link so that it never
+    clobbers a concurrent claimant, and the rollback path restores the captured
+    original the same way. Both therefore need hard-link support on the target
+    volume. Without this preflight the failure would surface only after the
+    original had already been moved aside, and the rollback would then fail for
+    the same reason, leaving the target absent.
+
+    Filesystems that typically cannot satisfy this: FAT32/exFAT removable
+    media, some SMB/NFS mounts, and some container bind mounts.
+    """
+    # One token for both probe names, so a partial cleanup is still recognisable
+    # as a single probe pair rather than two unrelated leftovers.
+    token = uuid.uuid4().hex
+    probe_source = directory / f".hardlink-probe-{token}.tmp"
+    probe_link = directory / f".hardlink-probe-{token}.link.tmp"
+    try:
+        try:
+            probe_source.write_bytes(b"hardlink-probe")
+        except OSError as exc:
+            raise RuntimeError(
+                f"cannot write a probe file next to the replacement target: {exc}"
+            ) from exc
+        try:
+            os.link(probe_source, probe_link)
+        except OSError as exc:
+            raise RuntimeError(
+                "live replacement requires hard-link support on the volume holding "
+                f"{str(directory)}, and this filesystem rejected os.link ({exc}). "
+                "Both candidate publication and rollback depend on it, so the run "
+                "stops now while the target is still untouched. Move the session "
+                "file to a volume that supports hard links (for example NTFS or "
+                "ext4) or use candidate output instead of --replace-original."
+            ) from exc
+    finally:
+        # The link is removed first: while it exists the probe occupies two
+        # names, and unlinking the source alone would leave the link behind
+        # holding the inode. FileNotFoundError is a subclass of OSError, so
+        # catching OSError covers the already-absent case too; both are ignored
+        # because a probe that cannot be removed must not mask the real result.
+        for probe in (probe_link, probe_source):
+            try:
+                probe.unlink()
+            except OSError:
+                pass
+
+
 def _publish_no_clobber(source_path: pathlib.Path, destination_path: pathlib.Path) -> None:
     """Atomically create destination without replacing any concurrent claimant."""
     if destination_path.exists():
@@ -2075,6 +2125,10 @@ def _replace_file_after_validation(
     source_sha256 = sha256_hex(source_bytes)
     if expected_source_sha256 is not None and source_sha256 != expected_source_sha256:
         raise RuntimeError("input JSONL changed after candidate generation; original file was not replaced")
+    # Preflight before anything is staged, backed up or moved. Publication and
+    # rollback both rely on os.link, so an unsupported volume must stop the run
+    # while the target is still in place.
+    verify_hardlink_support(target_path.parent)
     tmp_replace = target_path.with_name(f".{target_path.name}.replace-{uuid.uuid4().hex}.tmp")
     old_capture = target_path.with_name(f".{target_path.name}.old-{uuid.uuid4().hex}.tmp")
     backup: Optional[pathlib.Path] = None
@@ -2929,6 +2983,7 @@ def choose_resume_leaf_info(
     info: Dict[str, Any] = {
         "ok": False,
         "status": "absent" if last_prompt_entry is None else "unvalidated",
+        # rejection paths share one status value, so status alone cannot
         "errors": [],
         "warnings": [],
         "lastPromptIndex": last_prompt_entry[0] if last_prompt_entry else None,

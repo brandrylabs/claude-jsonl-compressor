@@ -469,6 +469,117 @@ class TestStructuralSafetyContracts(unittest.TestCase):
 
         self.assertEqual(observed, (True, True))
 
+    def test_hardlink_preflight_stops_before_touching_the_live_target(self):
+        """os.link is required by both publication and rollback.
+
+        Without a preflight the failure would surface only after the original
+        had been moved aside, and the rollback would then fail for the same
+        reason, leaving the target absent.
+        """
+        record = {
+            "type": "user",
+            "uuid": "11111111-1111-1111-1111-111111111111",
+            "parentUuid": None,
+            "sessionId": "22222222-2222-2222-2222-222222222222",
+            "message": {"role": "user", "content": "hello"},
+        }
+        line = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
+        with tempfile.TemporaryDirectory() as raw_dir:
+            work = pathlib.Path(raw_dir)
+            target = work / "session.jsonl"
+            candidate = work / "candidate.jsonl"
+            target.write_bytes(line)
+            candidate.write_bytes(line)
+            before = target.read_bytes()
+            entries_before = sorted(path.name for path in work.iterdir())
+
+            def refuse_link(_source, _destination):
+                raise OSError(1, "operation not permitted")
+
+            reached_backup = []
+            real_backup = ccj._exclusive_backup_from_bytes
+
+            def spy_backup(*args, **kwargs):
+                reached_backup.append(True)
+                return real_backup(*args, **kwargs)
+
+            with mock.patch.object(ccj.os, "link", refuse_link):
+                with mock.patch.object(ccj, "_exclusive_backup_from_bytes", spy_backup):
+                    with self.assertRaises(RuntimeError) as caught:
+                        ccj._replace_file_after_validation(candidate, target)
+
+            message = str(caught.exception)
+            # The preflight must reject before backup creation is attempted.
+            # Without it the run still fails safely, but only once it reaches
+            # backup publication, and the message is the low-level one that
+            # does not tell the caller what to do about it.
+            self.assertEqual(reached_backup, [], "preflight must run before backup creation")
+            self.assertIn("hard-link support on the volume", message)
+            self.assertIn("still untouched", message)
+            self.assertTrue(target.exists(), "live target must survive the refusal")
+            self.assertEqual(target.read_bytes(), before)
+            self.assertEqual(sorted(path.name for path in work.iterdir()), entries_before)
+
+    def test_hardlink_probe_cleans_up_and_passes_on_a_supported_volume(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            work = pathlib.Path(raw_dir)
+            ccj.verify_hardlink_support(work)
+            self.assertEqual(list(work.iterdir()), [])
+
+    def test_hardlink_probe_leaves_nothing_behind_when_linking_is_refused(self):
+        """The failing path must clean up too, not only the passing one.
+
+        The preflight runs in the directory that holds a live session file. A
+        probe left behind on every refusal would accumulate hidden files right
+        next to the user's transcript, and on a filesystem that always refuses
+        os.link every retry would add another one.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            work = pathlib.Path(raw_dir)
+
+            def refuse_link(_source, _destination):
+                raise OSError(1, "operation not permitted")
+
+            with mock.patch.object(ccj.os, "link", refuse_link):
+                with self.assertRaises(RuntimeError) as caught:
+                    ccj.verify_hardlink_support(work)
+
+            self.assertEqual(
+                list(work.iterdir()), [], "a refused probe must not leave files behind"
+            )
+            # The directory is named so the caller knows which volume to move off.
+            self.assertIn(str(work), str(caught.exception))
+
+    def test_hardlink_probe_is_removed_even_if_unlink_of_the_link_fails(self):
+        """A probe that cannot be removed must not mask the real result.
+
+        The cleanup runs in a finally block, so an OSError raised while removing
+        the link would otherwise replace the actionable RuntimeError with an
+        unrelated failure about a temporary file.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            work = pathlib.Path(raw_dir)
+            real_unlink = pathlib.Path.unlink
+            refused = []
+
+            def refuse_first_unlink(self, *args, **kwargs):
+                if self.name.endswith(".link.tmp") and not refused:
+                    refused.append(self.name)
+                    raise OSError(13, "permission denied")
+                return real_unlink(self, *args, **kwargs)
+
+            def refuse_link(_source, _destination):
+                raise OSError(1, "operation not permitted")
+
+            with mock.patch.object(ccj.os, "link", refuse_link):
+                with mock.patch.object(pathlib.Path, "unlink", refuse_first_unlink):
+                    with self.assertRaises(RuntimeError) as caught:
+                        ccj.verify_hardlink_support(work)
+
+            self.assertEqual(len(refused), 1, "the unlink failure was not injected")
+            self.assertIn("hard-link support on the volume", str(caught.exception))
+            self.assertNotIn("permission denied", str(caught.exception))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

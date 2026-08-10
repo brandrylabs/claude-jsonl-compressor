@@ -20,8 +20,8 @@ NPM = shutil.which("npm")
 PUBLIC_ROOT_FILES = {
     ".gitignore", "CHANGELOG.md", "LICENSE", "NOTICE", "README.md", "SKILL.md", "package.json",
 }
+PUBLIC_EXACT_FILES = {".github/workflows/ci.yml"}
 PUBLIC_DIR_SUFFIXES = {
-    ".github": {".yml"},
     "agents": {".yaml"},
     "bin": {".cjs"},
     "config": {".json"},
@@ -119,6 +119,8 @@ class TestNpmPackage(unittest.TestCase):
             relative = path.relative_to(ROOT)
             if len(relative.parts) == 1:
                 self.assertIn(relative.as_posix(), PUBLIC_ROOT_FILES)
+            elif relative.as_posix() in PUBLIC_EXACT_FILES:
+                pass
             else:
                 top = relative.parts[0]
                 self.assertIn(top, PUBLIC_DIR_SUFFIXES, relative.as_posix())
@@ -128,6 +130,26 @@ class TestNpmPackage(unittest.TestCase):
             self.assertNotIn("model-pack", lowered_name, relative.as_posix())
             self.assertNotIn("model-summary", lowered_name, relative.as_posix())
             self.assert_private_markers_absent(relative.as_posix(), path.read_bytes())
+
+    def test_ci_pins_actions_and_suppresses_lifecycle_hooks(self):
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        expected_actions = {
+            "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
+            "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0",
+            "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0",
+        }
+        for action in expected_actions:
+            self.assertIn(action, workflow)
+        self.assertIsNone(re.search(r"uses:\s+actions/[^@\s]+@v\d+\b", workflow))
+        for command in (
+            "npm test --ignore-scripts",
+            "npm pack --dry-run --json --ignore-scripts",
+            "npm publish --dry-run --access public --tag rc --ignore-scripts",
+        ):
+            self.assertIn(command, workflow)
+        self.assertIn("permissions:\n  contents: read", workflow)
+        self.assertEqual(workflow.count("persist-credentials: false"), 2)
+        self.assertEqual(workflow.count("fail-fast: false"), 2)
 
     def test_manifest_has_no_runtime_dependencies_or_install_hooks(self):
         manifest = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
@@ -271,7 +293,9 @@ class TestNpmPackage(unittest.TestCase):
         self.assertIsNotNone(NPM, "npm must be available for release-package tests")
         with tempfile.TemporaryDirectory(prefix="cjc_npm_") as tmp_name:
             tmp = pathlib.Path(tmp_name)
-            packed = run(str(NPM), "pack", "--json", "--pack-destination", str(tmp))
+            packed = run(
+                str(NPM), "pack", "--json", "--ignore-scripts", "--pack-destination", str(tmp)
+            )
             self.assertEqual(packed.returncode, 0, packed.stderr)
             metadata = json.loads(packed.stdout)
             self.assertEqual(len(metadata), 1)

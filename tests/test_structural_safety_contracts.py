@@ -6,6 +6,7 @@ import contextlib
 import io
 import json
 import pathlib
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -468,6 +469,85 @@ class TestStructuralSafetyContracts(unittest.TestCase):
             observed = (parsed_ack(ccj.parse_args), parsed_ack(rcj.parse_args))
 
         self.assertEqual(observed, (True, True))
+
+    def test_session_listing_survives_a_short_name_root_on_windows(self):
+        """A root written with 8.3 short components must still enumerate.
+
+        The escape guard compares a child against its resolved form. Comparing
+        resolve() with os.path.abspath() rejected every entry when any root
+        component was a short name, because resolve() expands short names and
+        abspath() does not, so the locator found nothing at all.
+        """
+        if sys.platform != "win32":
+            self.skipTest("8.3 short names are a Windows-only path form")
+        import ctypes
+
+        with tempfile.TemporaryDirectory() as raw_dir:
+            long_root = pathlib.Path(raw_dir) / "projects"
+            long_root.mkdir(parents=True)
+            session = long_root / "session-shortname.jsonl"
+            session.write_text(
+                json.dumps({"type": "custom-title", "title": "short name probe"}) + "\n",
+                encoding="utf-8",
+            )
+
+            buffer = ctypes.create_unicode_buffer(1024)
+            written = ctypes.windll.kernel32.GetShortPathNameW(str(long_root), buffer, 1024)
+            if not written:
+                self.skipTest("the filesystem did not provide a short path form")
+            short_root = pathlib.Path(buffer.value)
+            if short_root == long_root:
+                self.skipTest("8.3 short names are disabled on this volume")
+
+            listed = cst.list_session_files(short_root)
+            self.assertEqual(len(listed), 1, f"short-name root enumerated nothing: {short_root}")
+            self.assertEqual(listed[0].resolve(), session.resolve())
+            self.assertEqual(
+                cst.find_unique_session(short_root, "session-shortname").resolve(),
+                session.resolve(),
+            )
+
+    def test_short_name_root_still_enumerates_nested_sessions(self):
+        """The walk must descend past the root when the root is a short name.
+
+        The flat case above never reaches the directory filter, so it cannot
+        show that recursion survives. Each nested directory is resolved on its
+        own, and a short-name component in the root propagates into every child
+        comparison, so a regression here would silently return only the files
+        that happen to sit at the top level.
+        """
+        if sys.platform != "win32":
+            self.skipTest("8.3 short names are a Windows-only path form")
+        import ctypes
+
+        with tempfile.TemporaryDirectory() as raw_dir:
+            long_root = pathlib.Path(raw_dir) / "projects-with-a-deliberately-long-name"
+            nested = long_root / "nested-project-directory" / "deeper-still"
+            nested.mkdir(parents=True)
+            record = json.dumps({"type": "custom-title", "title": "nested probe"}) + "\n"
+            top = long_root / "top.jsonl"
+            middle = long_root / "nested-project-directory" / "middle.jsonl"
+            deep = nested / "deep.jsonl"
+            for path in (top, middle, deep):
+                path.write_text(record, encoding="utf-8")
+
+            buffer = ctypes.create_unicode_buffer(1024)
+            if not ctypes.windll.kernel32.GetShortPathNameW(str(long_root), buffer, 1024):
+                self.skipTest("the filesystem did not provide a short path form")
+            short_root = pathlib.Path(buffer.value)
+            if short_root == long_root:
+                self.skipTest("8.3 short names are disabled on this volume")
+
+            listed = sorted(path.resolve() for path in cst.list_session_files(short_root))
+            self.assertEqual(
+                listed,
+                sorted(path.resolve() for path in (top, middle, deep)),
+                f"nested enumeration lost entries under {short_root}",
+            )
+            self.assertEqual(
+                cst.find_unique_session(short_root, "deep").resolve(),
+                deep.resolve(),
+            )
 
 
 if __name__ == "__main__":

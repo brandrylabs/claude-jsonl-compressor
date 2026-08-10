@@ -33,6 +33,25 @@ REPORT_SCHEMA_VERSION = 1
 PRIOR_SUMMARY_VERBATIM_BUDGET_FACTOR = 1.5
 MIN_SUMMARY_CHAR_BUDGET = 4000
 DEFAULT_MODEL_PACK_ESTIMATED_TOKEN_BUDGET = 150000
+RESUME_REASON_CODE_STATUS = {
+    "last-prompt-absent": "absent",
+    "duplicate-uuid": "duplicate-uuid",
+    "leaf-uuid-malformed": "malformed",
+    "chain-missing-uuid": "dangling",
+    "chain-loop": "loop",
+    "chain-malformed-parent": "malformed-parent",
+    "chain-empty": "dangling",
+    "chain-non-monotonic": "non-monotonic",
+    "lineage-unsafe": "session-mismatch",
+    "extension-limit-exceeded": "extension-limit",
+    "extension-authority-session-missing": "session-mismatch",
+    "extension-record-missing-uuid": "extension-unsafe",
+    "extension-record-not-linear-descendant": "extension-branch",
+    "extension-record-session-mismatch": "session-mismatch",
+    "extension-record-not-safe-closure": "extension-unsafe",
+    "extension-pending-tool-ids": "extension-unsafe",
+    "ok": "valid",
+}
 
 
 def configure_stdio() -> None:
@@ -2916,6 +2935,16 @@ def _allowed_post_prompt_closure(obj: JsonObj, pending_tool_ids: set) -> Tuple[b
     return False, f"unsupported_record_type:{obj.get('type')}"
 
 
+def _reject_resume_path(info: Dict[str, Any], reason_code: str, error: str) -> Dict[str, Any]:
+    status = RESUME_REASON_CODE_STATUS.get(reason_code)
+    if status is None or status == "valid":
+        raise AssertionError(f"invalid resume-path rejection code: {reason_code}")
+    info["status"] = status
+    info["reasonCode"] = reason_code
+    info["errors"].append(error)
+    return info
+
+
 def choose_resume_leaf_info(
     records: Sequence[JsonObj],
     max_post_prompt_extension: int = 0,
@@ -2931,11 +2960,8 @@ def choose_resume_leaf_info(
     )
     info: Dict[str, Any] = {
         "ok": False,
-        "status": "absent" if last_prompt_entry is None else "unvalidated",
-        # reasonCode is a finer-grained companion to status. Several distinct
-        # rejection paths share one status value, so status alone cannot
-        # identify which check fired; reasonCode is unique per site.
-        "reasonCode": "last-prompt-absent" if last_prompt_entry is None else None,
+        "status": "unvalidated",
+        "reasonCode": None,
         "errors": [],
         "warnings": [],
         "lastPromptIndex": last_prompt_entry[0] if last_prompt_entry else None,
@@ -2963,6 +2989,7 @@ def choose_resume_leaf_info(
         "sessionLineageRunCount": 0,
         "sessionLineageTransitionCount": 0,
         "sessionLineageRunsDigest": None,
+        "lineageReason": None,
         "currentSessionStartPosition": 0,
         "currentSessionRecordCount": 0,
         "currentSessionId": None,
@@ -2971,21 +2998,26 @@ def choose_resume_leaf_info(
         "authoritySessionId": last_prompt_entry[1].get("sessionId") if last_prompt_entry else None,
     }
     if duplicate_uuids:
-        info["status"] = "duplicate-uuid"
-        info["reasonCode"] = "duplicate-uuid"
-        info["errors"].append(f"duplicate uuid values make resume topology ambiguous: {duplicate_uuids[:20]}")
-        return info
+        return _reject_resume_path(
+            info,
+            "duplicate-uuid",
+            f"duplicate uuid values make resume topology ambiguous: {duplicate_uuids[:20]}",
+        )
     if last_prompt_entry is None:
-        info["errors"].append("strict active-chain mode requires a last-prompt record")
-        return info
+        return _reject_resume_path(
+            info,
+            "last-prompt-absent",
+            "strict active-chain mode requires a last-prompt record",
+        )
 
     prompt_index, prompt_record = last_prompt_entry
     prompt_leaf = resume_leaf_override or prompt_record.get("leafUuid")
     if not isinstance(prompt_leaf, str) or not prompt_leaf:
-        info["status"] = "malformed"
-        info["reasonCode"] = "leaf-uuid-malformed"
-        info["errors"].append("authoritative last-prompt leafUuid is missing or malformed")
-        return info
+        return _reject_resume_path(
+            info,
+            "leaf-uuid-malformed",
+            "authoritative last-prompt leafUuid is missing or malformed",
+        )
     info["selectedLeafUuid"] = prompt_leaf
     trace = chain_trace_from_leaf(records, prompt_leaf)
     info["promptChainMissingUuid"] = trace.get("missingUuid")
@@ -2993,29 +3025,27 @@ def choose_resume_leaf_info(
     info["promptChainMalformedParentUuid"] = trace.get("malformedParentUuid")
     info["promptChainMalformedParentType"] = trace.get("malformedParentType")
     if trace.get("missingUuid"):
-        info["status"] = "dangling"
-        info["reasonCode"] = "chain-missing-uuid"
-        info["errors"].append(f"authoritative resume chain references missing uuid: {trace.get('missingUuid')}")
-        return info
-    if trace.get("loopUuid"):
-        info["status"] = "loop"
-        info["reasonCode"] = "chain-loop"
-        info["errors"].append(f"authoritative resume chain contains a loop at uuid: {trace.get('loopUuid')}")
-        return info
-    if trace.get("malformedParentUuid"):
-        info["status"] = "malformed-parent"
-        info["reasonCode"] = "chain-malformed-parent"
-        info["errors"].append(
-            "authoritative resume chain contains a non-null, non-empty-string parentUuid "
-            f"on uuid {trace.get('malformedParentUuid')} (type {trace.get('malformedParentType')})"
+        return _reject_resume_path(
+            info,
+            "chain-missing-uuid",
+            f"authoritative resume chain references missing uuid: {trace.get('missingUuid')}",
         )
-        return info
+    if trace.get("loopUuid"):
+        return _reject_resume_path(
+            info,
+            "chain-loop",
+            f"authoritative resume chain contains a loop at uuid: {trace.get('loopUuid')}",
+        )
+    if trace.get("malformedParentUuid"):
+        return _reject_resume_path(
+            info,
+            "chain-malformed-parent",
+            "authoritative resume chain contains a non-null, non-empty-string parentUuid "
+            f"on uuid {trace.get('malformedParentUuid')} (type {trace.get('malformedParentType')})",
+        )
     chain = list(trace.get("chain") or [])
     if not chain:
-        info["status"] = "dangling"
-        info["reasonCode"] = "chain-empty"
-        info["errors"].append("authoritative resume chain is empty")
-        return info
+        return _reject_resume_path(info, "chain-empty", "authoritative resume chain is empty")
     uuid_to_index = {
         obj.get("uuid"): idx for idx, obj in enumerate(records)
         if isinstance(obj.get("uuid"), str) and obj.get("uuid")
@@ -3025,13 +3055,12 @@ def choose_resume_leaf_info(
     info["nonMonotonicEdgeCount"] = order_info["inversionCount"]
     info["nonMonotonicCompatibilityEdgeCount"] = order_info["compatibilityEdgeCount"]
     if not order_info["ok"]:
-        info["status"] = "non-monotonic"
-        info["reasonCode"] = "chain-non-monotonic"
-        info["errors"].append(
+        return _reject_resume_path(
+            info,
+            "chain-non-monotonic",
             "authoritative resume chain has non-monotonic physical parent edges outside the "
-            "same-session attachment compatibility rule"
+            "same-session attachment compatibility rule",
         )
-        return info
     if order_info["compatibilityEdgeCount"]:
         info["warnings"].append(
             f"accepted {order_info['compatibilityEdgeCount']} same-session attachment parent edges "
@@ -3044,17 +3073,17 @@ def choose_resume_leaf_info(
     info["sessionLineageRunCount"] = lineage_info["runCount"]
     info["sessionLineageTransitionCount"] = lineage_info["transitionCount"]
     info["sessionLineageRunsDigest"] = lineage_info["runsDigest"]
+    info["lineageReason"] = lineage_info["reason"]
     info["currentSessionStartPosition"] = lineage_info["currentSessionStartPosition"]
     info["currentSessionRecordCount"] = lineage_info["currentSessionRecordCount"]
     info["currentSessionId"] = lineage_info["currentSessionId"]
     if not lineage_info["ok"]:
-        info["status"] = "session-mismatch"
-        info["reasonCode"] = "lineage-unsafe"
-        info["errors"].append(
+        return _reject_resume_path(
+            info,
+            "lineage-unsafe",
             "authoritative resume chain has an unsafe sessionId lineage: "
-            f"{lineage_info['reason']}"
+            f"{lineage_info['reason']}",
         )
-        return info
     if lineage_info["compatibility"]:
         info["warnings"].append(
             f"accepted one-way session lineage with {lineage_info['transitionCount']} transition(s); "
@@ -3065,57 +3094,58 @@ def choose_resume_leaf_info(
         extension_pairs = list(enumerate(records[prompt_index + 1 :], start=prompt_index + 1))
         if extension_pairs:
             if len(extension_pairs) > max_post_prompt_extension:
-                info["status"] = "extension-limit"
-                info["reasonCode"] = "extension-limit-exceeded"
-                info["errors"].append(
-                    f"post-last-prompt closure has {len(extension_pairs)} UUID records, exceeding limit {max_post_prompt_extension}"
+                return _reject_resume_path(
+                    info,
+                    "extension-limit-exceeded",
+                    f"post-last-prompt closure has {len(extension_pairs)} UUID records, "
+                    f"exceeding limit {max_post_prompt_extension}",
                 )
-                return info
             expected_parent = prompt_leaf
             expected_session = prompt_record.get("sessionId")
             if not isinstance(expected_session, str) or not expected_session:
-                info["status"] = "session-mismatch"
-                info["reasonCode"] = "extension-authority-session-missing"
-                info["errors"].append("post-last-prompt closure requires a non-empty authority sessionId")
-                return info
+                return _reject_resume_path(
+                    info,
+                    "extension-authority-session-missing",
+                    "post-last-prompt closure requires a non-empty authority sessionId",
+                )
             pending_tool_ids = set(tool_use_ids(chain[-1]))
             extension_reasons: List[str] = []
             for idx, obj in extension_pairs:
                 if not isinstance(obj.get("uuid"), str) or not obj.get("uuid"):
-                    info["status"] = "extension-unsafe"
-                    info["reasonCode"] = "extension-record-missing-uuid"
-                    info["errors"].append(
-                        f"post-last-prompt record L{idx + 1} has no UUID and breaks the physical closure sequence"
+                    return _reject_resume_path(
+                        info,
+                        "extension-record-missing-uuid",
+                        f"post-last-prompt record L{idx + 1} has no UUID and breaks the physical closure sequence",
                     )
-                    return info
                 if obj.get("parentUuid") != expected_parent:
-                    info["status"] = "extension-branch"
-                    info["reasonCode"] = "extension-record-not-linear-descendant"
-                    info["errors"].append(f"post-last-prompt record L{idx + 1} is not a direct linear descendant")
-                    return info
+                    return _reject_resume_path(
+                        info,
+                        "extension-record-not-linear-descendant",
+                        f"post-last-prompt record L{idx + 1} is not a direct linear descendant",
+                    )
                 obj_session = obj.get("sessionId")
                 if not isinstance(obj_session, str) or not obj_session or obj_session != expected_session:
-                    info["status"] = "session-mismatch"
-                    info["reasonCode"] = "extension-record-session-mismatch"
-                    info["errors"].append(
-                        f"post-last-prompt record L{idx + 1} does not have the exact authority sessionId"
+                    return _reject_resume_path(
+                        info,
+                        "extension-record-session-mismatch",
+                        f"post-last-prompt record L{idx + 1} does not have the exact authority sessionId",
                     )
-                    return info
                 allowed, reason = _allowed_post_prompt_closure(obj, pending_tool_ids)
                 if not allowed:
-                    info["status"] = "extension-unsafe"
-                    info["reasonCode"] = "extension-record-not-safe-closure"
-                    info["errors"].append(f"post-last-prompt record L{idx + 1} is not a safe closure: {reason}")
-                    return info
+                    return _reject_resume_path(
+                        info,
+                        "extension-record-not-safe-closure",
+                        f"post-last-prompt record L{idx + 1} is not a safe closure: {reason}",
+                    )
                 extension_reasons.append(reason)
                 expected_parent = obj.get("uuid")
             if pending_tool_ids:
-                info["status"] = "extension-unsafe"
-                info["reasonCode"] = "extension-pending-tool-ids"
-                info["errors"].append(
-                    f"post-last-prompt closure leaves pending tool_use ids unresolved: {sorted(pending_tool_ids)[:20]}"
+                return _reject_resume_path(
+                    info,
+                    "extension-pending-tool-ids",
+                    f"post-last-prompt closure leaves pending tool_use ids unresolved: "
+                    f"{sorted(pending_tool_ids)[:20]}",
                 )
-                return info
             selected_extension_records = [obj for _, obj in extension_pairs]
             chain.extend(selected_extension_records)
             chain_indexes.extend(idx for idx, _ in extension_pairs)
@@ -3128,7 +3158,7 @@ def choose_resume_leaf_info(
             info["postLastPromptExtensionUuids"] = [obj.get("uuid") for _, obj in extension_pairs]
             info["currentSessionRecordCount"] = int(info.get("currentSessionRecordCount") or 0) + len(extension_pairs)
 
-    info["status"] = "valid"
+    info["status"] = RESUME_REASON_CODE_STATUS["ok"]
     info["reasonCode"] = "ok"
     info["ok"] = True
     info["activeChainIndexes"] = chain_indexes
@@ -3143,7 +3173,11 @@ def require_resume_leaf_info(
 ) -> Dict[str, Any]:
     info = choose_resume_leaf_info(records, max_post_prompt_extension, resume_leaf_override)
     if not info.get("ok"):
-        raise ValueError("strict active-chain topology failed: " + "; ".join(info.get("errors") or [str(info.get("status"))]))
+        reason_code = info.get("reasonCode") or "unknown"
+        raise ValueError(
+            f"strict active-chain topology failed (reasonCode={reason_code}): "
+            + "; ".join(info.get("errors") or [str(info.get("status"))])
+        )
     return info
 
 

@@ -78,6 +78,7 @@ class TestBasicCompression(CompressBase):
         self.assertEqual(report["codex_offline_compression_version"], "v10")
         self.assertEqual(report["model_pack_schema_version"], 11)
         self.assertEqual(report["report_schema_version"], 1)
+        self.assertEqual(report["resume_leaf_info"]["reasonCode"], "ok")
         self.assertEqual(report["input"], "src.jsonl")
         self.assertEqual(report["output"], "out.jsonl")
         self.assertAlmostEqual(
@@ -87,8 +88,10 @@ class TestBasicCompression(CompressBase):
         recs = fx.read_jsonl(out)
         boundary = next(r for r in recs if r.get("type") == "system" and r.get("subtype") == "compact_boundary")
         self.assertEqual(boundary["compactMetadata"]["codexOfflineCompressionVersion"], "v10")
+        self.assertEqual(boundary["compactMetadata"]["resumeLeafInfo"]["reasonCode"], "ok")
         report_text = out.with_suffix(out.suffix + ".report.md").read_text(encoding="utf-8")
         self.assertIn("Active-chain records summarized", report_text)
+        self.assertIn('"reasonCode": "ok"', report_text)
         self.assertIn("Excluded inactive-branch records", report_text)
         self.assertIn("Source SHA-256", report_text)
         self.assertNotIn("- Omitted digest:", report_text)
@@ -1029,6 +1032,24 @@ This intentionally cites an omitted but non-visible line anchor L{bad_anchor} to
         self.assertIn("--write-model-pack process files must be outside the entire .claude directory", err.getvalue())
         self.assertFalse(pack_path.exists())
 
+    def test_cli_write_model_pack_stdout_includes_resume_reason_code(self):
+        tb = fx.build_linear("78787878-7878-7878-7878-787878787878", turns=80)
+        src = fx.write_jsonl(self.tmp / "cli_pack_src.jsonl", tb.records)
+        pack_path = self.tmp / "cli_pack.md"
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = ccj.main([
+                "--input", str(src),
+                "--write-model-pack", str(pack_path),
+                "--target-ratio", "0.30",
+                "--min-recent-records", "8",
+                "--summary-char-budget", "12000",
+            ])
+        result = json.loads(stdout.getvalue())
+        self.assertEqual(code, 0)
+        self.assertTrue(pack_path.exists())
+        self.assertEqual(result["resume_leaf_info"]["reasonCode"], "ok")
+
     def test_cli_deterministic_summary_requires_explicit_flag(self):
         tb = fx.build_linear("7a7a7a7a-7a7a-7a7a-7a7a-7a7a7a7a7a7a", turns=80, with_tools_every=8)
         src = fx.write_jsonl(self.tmp / "cli_fallback_src.jsonl", tb.records)
@@ -1042,6 +1063,7 @@ This intentionally cites an omitted but non-visible line anchor L{bad_anchor} to
                 "--deterministic-summary",
             ])
         self.assertEqual(code, 0, stdout.getvalue())
+        self.assertEqual(json.loads(stdout.getvalue())["resume_leaf_info"]["reasonCode"], "ok")
         self.assertTrue(out.exists())
 
 
@@ -1078,6 +1100,7 @@ class TestActiveChain(CompressBase):
             model_pack_char_budget=500000,
         )
         self.assertNotIn("DEAD branch", pack["text"])
+        self.assertEqual(pack["resume_leaf_info"]["reasonCode"], "ok")
         self.assertEqual(report["excluded_branch_count"], 30)
 
     def test_broken_last_prompt_leaf_fails_closed(self):
@@ -1085,12 +1108,14 @@ class TestActiveChain(CompressBase):
         for r in tb.records:
             if r.get("type") == "last-prompt":
                 r["leafUuid"] = "dead-uuid-does-not-exist"
-        with self.assertRaisesRegex(ValueError, "missing uuid"):
+        with self.assertRaisesRegex(ValueError, r"reasonCode=chain-missing-uuid.*missing uuid"):
             self.compress(tb.records, summary_char_budget=6000, min_recent_records=5, target_ratio=0.3)
 
     def test_no_last_prompt_requires_explicit_physical_tail(self):
         tb = fx.build_linear("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", turns=30)
         tb.records = [r for r in tb.records if r.get("type") != "last-prompt"]
+        info = ccj.choose_resume_leaf_info(tb.records)
+        self.assertEqual((info["status"], info["reasonCode"]), ("absent", "last-prompt-absent"))
         with self.assertRaisesRegex(ValueError, "requires a last-prompt"):
             self.compress(tb.records, summary_char_budget=6000, min_recent_records=5, target_ratio=0.3)
         report, _out = self.compress(
@@ -1196,6 +1221,7 @@ class TestActiveChain(CompressBase):
         info = ccj.choose_resume_leaf_info(tb.records)
         self.assertFalse(info["ok"])
         self.assertEqual(info["status"], "malformed")
+        self.assertEqual(info["reasonCode"], "leaf-uuid-malformed")
 
     def test_physical_last_valid_pointer_wins_when_two_are_present(self):
         tb = fx.build_linear("cacacaca-caca-caca-caca-cacacacacaca", turns=35)
@@ -1205,6 +1231,7 @@ class TestActiveChain(CompressBase):
         info = ccj.choose_resume_leaf_info(tb.records)
         self.assertTrue(info["ok"], info["errors"])
         self.assertEqual(info["selectedLeafUuid"], newer_leaf)
+        self.assertEqual(info["reasonCode"], "ok")
         self.assertNotEqual(info["selectedLeafUuid"], older_leaf)
         self.assertEqual(info["lastPromptLine"], len(tb.records))
 
@@ -1214,6 +1241,7 @@ class TestActiveChain(CompressBase):
         info = ccj.choose_resume_leaf_info(tb.records)
         self.assertFalse(info["ok"])
         self.assertEqual(info["status"], "dangling")
+        self.assertEqual(info["reasonCode"], "chain-missing-uuid")
 
     def test_active_chain_loop_fails_closed(self):
         tb = fx.build_linear("c3c3c3c3-c3c3-c3c3-c3c3-c3c3c3c3c3c3", turns=35)
@@ -1222,6 +1250,7 @@ class TestActiveChain(CompressBase):
         info = ccj.choose_resume_leaf_info(tb.records)
         self.assertFalse(info["ok"])
         self.assertEqual(info["status"], "loop")
+        self.assertEqual(info["reasonCode"], "chain-loop")
 
     def test_active_chain_cross_session_fails_closed(self):
         tb = fx.build_linear("c4c4c4c4-c4c4-c4c4-c4c4-c4c4c4c4c4c4", turns=35)
@@ -1229,6 +1258,8 @@ class TestActiveChain(CompressBase):
         info = ccj.choose_resume_leaf_info(tb.records)
         self.assertFalse(info["ok"])
         self.assertEqual(info["status"], "session-mismatch")
+        self.assertEqual(info["reasonCode"], "lineage-unsafe")
+        self.assertEqual(info["lineageReason"], "session-lineage-returns-to-an-earlier-session")
 
     def test_active_chain_non_monotonic_parent_order_fails_closed(self):
         tb = fx.build_linear("c5c5c5c5-c5c5-c5c5-c5c5-c5c5c5c5c5c5", turns=35)
@@ -1238,6 +1269,7 @@ class TestActiveChain(CompressBase):
         info = ccj.choose_resume_leaf_info(tb.records)
         self.assertFalse(info["ok"])
         self.assertEqual(info["status"], "non-monotonic")
+        self.assertEqual(info["reasonCode"], "chain-non-monotonic")
 
     def test_attachment_only_physical_inversion_is_normalized_in_output(self):
         tb = fx.build_linear("c7c7c7c7-c7c7-c7c7-c7c7-c7c7c7c7c7c7", turns=25)
@@ -1284,6 +1316,7 @@ class TestActiveChain(CompressBase):
         info = ccj.choose_resume_leaf_info(records)
         self.assertFalse(info["ok"])
         self.assertEqual(info["status"], "non-monotonic")
+        self.assertEqual(info["reasonCode"], "chain-non-monotonic")
 
     def test_one_way_session_lineage_summarizes_old_sessions_and_keeps_current_raw(self):
         old_session = "81818181-8181-8181-8181-818181818181"
@@ -1368,6 +1401,7 @@ class TestActiveChain(CompressBase):
         info = ccj.choose_resume_leaf_info(tb.records)
         self.assertFalse(info["ok"])
         self.assertEqual(info["status"], "malformed-parent")
+        self.assertEqual(info["reasonCode"], "chain-malformed-parent")
 
     def test_manual_resume_leaf_override_is_explicit_and_projected(self):
         tb = fx.build_linear("cececece-cece-cece-cece-cececececece", turns=50)
@@ -1460,6 +1494,7 @@ class TestActiveChain(CompressBase):
         info = ccj.choose_resume_leaf_info(tb.records)
         self.assertFalse(info["ok"])
         self.assertEqual(info["status"], "duplicate-uuid")
+        self.assertEqual(info["reasonCode"], "duplicate-uuid")
 
     def test_post_pointer_tool_result_requires_explicit_closure_limit(self):
         tb = fx.TranscriptBuilder("d3d3d3d3-d3d3-d3d3-d3d3-d3d3d3d3d3d3")
@@ -1475,6 +1510,7 @@ class TestActiveChain(CompressBase):
         self.assertEqual(default_info["selectedLeafUuid"], assistant_leaf)
         closure_info = ccj.choose_resume_leaf_info(tb.records, max_post_prompt_extension=1)
         self.assertTrue(closure_info["ok"], closure_info["errors"])
+        self.assertEqual(closure_info["reasonCode"], "ok")
         self.assertEqual(closure_info["selectedLeafUuid"], result["uuid"])
         self.assertEqual(closure_info["postLastPromptExtensionReasons"], ["tool_result_closure"])
 
@@ -1555,25 +1591,79 @@ class TestActiveChain(CompressBase):
         self.assertEqual(info["status"], "extension-branch")
         self.assertEqual(info["reasonCode"], "extension-record-not-linear-descendant")
 
-    def test_reason_code_is_unique_per_rejection_site(self):
-        """status is coarse; reasonCode must identify the exact check that fired.
-
-        Three distinct paths share status "extension-unsafe" and three share
-        "session-mismatch", so status alone cannot pin down which check
-        rejected the input.
-        """
-        source = pathlib.Path(ccj.__file__).read_text(encoding="utf-8")
-        start = source.index("def choose_resume_leaf_info(")
-        end = source.index("def require_resume_leaf_info(", start)
-        body = source[start:end]
-        statuses = re.findall(r'info\["status"\] = "([a-z-]+)"', body)
-        codes = re.findall(r'info\["reasonCode"\] = "([a-z-]+)"', body)
-        self.assertEqual(len(statuses), len(codes))
-        self.assertEqual(len(codes), len(set(codes)), "reasonCode values must be unique")
-        self.assertLess(
-            len(set(statuses)), len(set(codes)),
-            "reasonCode must be strictly finer-grained than status",
+    def test_reason_code_contract_has_one_stable_status_per_code(self):
+        self.assertEqual(
+            ccj.RESUME_REASON_CODE_STATUS,
+            {
+                "last-prompt-absent": "absent",
+                "duplicate-uuid": "duplicate-uuid",
+                "leaf-uuid-malformed": "malformed",
+                "chain-missing-uuid": "dangling",
+                "chain-loop": "loop",
+                "chain-malformed-parent": "malformed-parent",
+                "chain-empty": "dangling",
+                "chain-non-monotonic": "non-monotonic",
+                "lineage-unsafe": "session-mismatch",
+                "extension-limit-exceeded": "extension-limit",
+                "extension-authority-session-missing": "session-mismatch",
+                "extension-record-missing-uuid": "extension-unsafe",
+                "extension-record-not-linear-descendant": "extension-branch",
+                "extension-record-session-mismatch": "session-mismatch",
+                "extension-record-not-safe-closure": "extension-unsafe",
+                "extension-pending-tool-ids": "extension-unsafe",
+                "ok": "valid",
+            },
         )
+
+    def test_chain_empty_reason_code_is_a_defensive_runtime_outcome(self):
+        tb = fx.build_linear("d9d9d9d9-d9d9-d9d9-d9d9-d9d9d9d9d9d9", turns=3)
+        empty_trace = {
+            "chain": [],
+            "missingUuid": None,
+            "loopUuid": None,
+            "malformedParentUuid": None,
+            "malformedParentType": None,
+        }
+        with mock.patch.object(ccj, "chain_trace_from_leaf", return_value=empty_trace):
+            info = ccj.choose_resume_leaf_info(tb.records)
+        self.assertEqual((info["status"], info["reasonCode"]), ("dangling", "chain-empty"))
+
+    def test_extension_requires_authority_session_reason_code(self):
+        tb = fx.TranscriptBuilder("dadadada-dada-dada-dada-dadadadadada")
+        tb.user("read one source")
+        tb.tool_call_pair(file_path="C:\\synthetic\\source.md")
+        result = tb.records.pop()
+        tool_leaf = tb.records[-1]["uuid"]
+        tb.prev_uuid = tool_leaf
+        pointer = tb.last_prompt(tool_leaf)
+        pointer.pop("sessionId")
+        tb.add_raw(result)
+        info = ccj.choose_resume_leaf_info(tb.records, max_post_prompt_extension=1)
+        self.assertEqual(
+            (info["status"], info["reasonCode"]),
+            ("session-mismatch", "extension-authority-session-missing"),
+        )
+
+    def test_public_resume_info_preserves_contract_and_strips_internal_chain(self):
+        tb = fx.build_linear("dbdbdbdb-dbdb-dbdb-dbdb-dbdbdbdbdbdb", turns=3)
+        public = ccj.public_resume_leaf_info(ccj.choose_resume_leaf_info(tb.records))
+        self.assertEqual((public["status"], public["reasonCode"]), ("valid", "ok"))
+        self.assertNotIn("lastPromptTemplate", public)
+        self.assertNotIn("activeChainIndexes", public)
+        self.assertNotIn("activeChainUuids", public)
+        self.assertGreater(public["activeChainRecordCount"], 0)
+
+    def test_analyze_resume_path_cli_reports_reason_code_without_writes(self):
+        tb = fx.build_linear("dcdcdcdc-dcdc-dcdc-dcdc-dcdcdcdcdcdc", turns=3)
+        tb.records[-1]["leafUuid"] = 7
+        src = fx.write_jsonl(self.tmp / "malformed-pointer.jsonl", tb.records)
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = ccj.main(["--input", str(src), "--analyze-resume-path"])
+        result = json.loads(stdout.getvalue())
+        self.assertEqual(code, 2)
+        self.assertEqual((result["status"], result["reasonCode"]), ("malformed", "leaf-uuid-malformed"))
+        self.assertEqual(list(self.tmp.iterdir()), [src])
 
 
 class TestToolPairing(CompressBase):

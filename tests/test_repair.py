@@ -312,6 +312,8 @@ class TestStructuralClosureBlockers(RepairBase):
                 records = self.build_post_prompt_tool_closure(invalid_session_id)
                 info = ccj.choose_resume_leaf_info(records, max_post_prompt_extension=4)
                 self.assertFalse(info["ok"], info)
+                self.assertEqual(info["status"], "session-mismatch")
+                self.assertEqual(info["reasonCode"], "extension-record-session-mismatch")
 
     def test_post_prompt_extension_rejects_uuidless_record_before_closure(self):
         records = self.build_post_prompt_tool_closure(
@@ -322,6 +324,8 @@ class TestStructuralClosureBlockers(RepairBase):
         )
         info = ccj.choose_resume_leaf_info(records, max_post_prompt_extension=4)
         self.assertFalse(info["ok"], info)
+        self.assertEqual(info["status"], "extension-unsafe")
+        self.assertEqual(info["reasonCode"], "extension-record-missing-uuid")
 
     def test_orphan_tool_result_after_attachment_terminates_and_fails_closed(self):
         script = f"""
@@ -401,7 +405,9 @@ class TestReadPagesCli(RepairBase):
         self.assertEqual(code, 0)
         self.assertEqual(src.read_bytes(), before)
         self.assertEqual(list(self.tmp.iterdir()), [src])
-        self.assertEqual(json.loads(stdout.getvalue())["patchableMatchCount"], 1)
+        scan = json.loads(stdout.getvalue())
+        self.assertEqual(scan["patchableMatchCount"], 1)
+        self.assertEqual(scan["resumeTopology"]["reasonCode"], "ok")
 
     def test_candidate_mode_and_expectation_guard(self):
         _tb, source = self.build_source(["1"])
@@ -424,6 +430,7 @@ class TestReadPagesCli(RepairBase):
         self.assertTrue(report_path.exists())
         repair_report = json.loads(report_path.read_text(encoding="utf-8"))
         self.assertEqual(repair_report["reportSchemaVersion"], 1)
+        self.assertEqual(repair_report["plan"]["resumeTopology"]["reasonCode"], "ok")
         self.assertEqual(src.read_bytes(), source)
 
     def test_replace_original_creates_numbered_backup(self):

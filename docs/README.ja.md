@@ -214,7 +214,9 @@ python "$skill\scripts\compress_claude_jsonl.py" `
   --analyze-resume-path
 ```
 
-この処理は読み取り専用です。結果がゼロ以外の場合は、モデルパックを生成する前に解消しなければなりません。
+この処理は読み取り専用です。結果がゼロ以外の場合は、モデルパックを生成する前に解消しなければなりません。機械判定に使う正確な原因は
+`reasonCode` を参照してください。`status` は粗い分類です。安定値の一覧は
+[`references/claude-jsonl-compression-format.md`](../references/claude-jsonl-compression-format.md#authoritative-last-prompt) にあります。
 
 ### 2. モデル証拠パックを生成する
 
@@ -597,4 +599,3 @@ tests/
 ## ライセンス
 
 GPL-3.0-only。GPL の条項の下で、本プロジェクトを使用、調査、改変、再配布できます。改変版や本プロジェクトを組み込んだ版を配布する場合、対応するソースコードの提供と同一ライセンスの適用が必要になることがあります。配布される商用製品へ組み込む際は、ライセンスを確認してください。
-

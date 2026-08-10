@@ -215,6 +215,9 @@ python "$skill\scripts\compress_claude_jsonl.py" `
 ```
 
 This is read-only. A nonzero result must be resolved before model-pack generation.
+Use `reasonCode` for the exact machine-readable cause; `status` is only the
+coarse category. The stable value table is in
+[`references/claude-jsonl-compression-format.md`](references/claude-jsonl-compression-format.md#authoritative-last-prompt).
 
 ### 2. Generate A Model Evidence Pack
 

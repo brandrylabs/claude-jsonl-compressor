@@ -39,6 +39,38 @@ A transcript can contain records that play very different roles:
 
 Physical line order alone is therefore not a definition of current context.
 
+### Physical line accounting
+
+The JSONL framer recognizes records only at physical LF boundaries, removes a
+single CR before each LF, and skips blank physical lines. The parser keeps a
+trusted side map from each parsed record to its original 1-based physical line
+number. `validate_jsonl` and the `Read.pages` repair report use that map, so a
+blank line or an excluded branch cannot make an error point at the wrong file
+line. Input `_line`, `_mergedLines`, `_mergedUuids`, and
+`_validationContentLines` fields are untrusted and ignored; validation rebuilds
+record- and content-block provenance in an isolated projection.
+
+The model evidence pack uses its own `L<number>` logical nonblank-record
+coordinates because it is a reserialized evidence view; those anchors are not
+claims about physical source-file line numbers. Repair `recordLine`, validator
+diagnostic `line` fields, and the source active-chain preflight used by
+compression/model-pack generation, in contrast, refer to the original file's
+physical lines. The active-chain preflight is a logical projection, so it
+carries source-line provenance separately rather than renumbering the chain.
+
+Validation/report counters and `type`/`sessionId`/`subtype` metadata carried
+by validator or system-error diagnostics preserve ordinary short strings.
+Synthetic keys use the collision-safe angle-bracket namespace: `<missing>`,
+`<null>`, and `<invalid:json-type>`. A real string beginning with `<` is
+escaped by adding a second leading `<`; an unusually long real string is
+represented by a bounded `<string:length=...;sha256=...>` label that contains
+no original characters. Complex
+malformed values are labeled by JSON type rather than copied into diagnostics
+or model evidence. The same bound is applied recursively to public validator
+samples, nested diagnostic metadata, identifier-valued dictionary keys, and
+oversized source values embedded in error text. Ordinary error wording and
+physical-line locations remain readable when they contain only normal values.
+
 ## Common Observed Record Types
 
 | `type` | Observed purpose |

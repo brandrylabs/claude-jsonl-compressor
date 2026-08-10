@@ -38,7 +38,8 @@ exercise standalone entry points. Release verification also runs CLI smoke tests
   injection, session location, and built-in token ceiling.
 - `test_repair.py`: exact byte-span `Read.pages` repair, active/all scope,
   pending calls, duplicate keys, BOM/newlines/Unicode, idempotence, candidate
-  mode, and live numbered backup.
+  mode, live numbered backup, and physical `recordLine` reporting across blank
+  JSONL lines.
 - `test_package.py`: manifest policy, Node wrapper syntax/version parity, actual
   npm tarball allowlist/privacy scan, offline install, and CLI invocation.
 - `test_transaction_races.py`: publication-race and immutable-candidate fault
@@ -72,6 +73,12 @@ exercise standalone entry points. Release verification also runs CLI smoke tests
   candidate JSONL.
 - The six source partitions are mutually exclusive and complete, including in
   fixed-seed generated branch topologies.
+- Validator, compression/model-pack preflight, and repair diagnostics use
+  original physical JSONL line numbers; hostile `_line` metadata, inactive
+  branches, BOM/CRLF/Unicode-only blank lines, and merged assistant/result
+  fragments must not shift block-level diagnostics. Validator and system-error
+  diagnostics must also bound malformed metadata rather than copying it into
+  reports or model evidence.
 - Post-pointer closure is opt-in, linear, same-session, tool-result-only, and
   must close every pending tool ID; ordinary conversation, system/hook records,
   unrelated results and partial closure are rejected.

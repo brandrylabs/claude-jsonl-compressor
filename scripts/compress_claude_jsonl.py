@@ -33,6 +33,7 @@ REPORT_SCHEMA_VERSION = 1
 PRIOR_SUMMARY_VERBATIM_BUDGET_FACTOR = 1.5
 MIN_SUMMARY_CHAR_BUDGET = 4000
 DEFAULT_MODEL_PACK_ESTIMATED_TOKEN_BUDGET = 150000
+MAX_PUBLIC_DIAGNOSTIC_STRING_CHARS = 160
 RESUME_REASON_CODE_STATUS = {
     "last-prompt-absent": "absent",
     "duplicate-uuid": "duplicate-uuid",
@@ -1845,9 +1846,13 @@ def json_dump_line(obj: JsonObj) -> str:
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
 
 
-def parse_jsonl_bytes(data: bytes, source_label: str = "JSONL") -> Tuple[List[JsonObj], List[str]]:
+def parse_jsonl_bytes_with_lines(
+    data: bytes,
+    source_label: str = "JSONL",
+) -> Tuple[List[JsonObj], List[str], List[int]]:
     records: List[JsonObj] = []
     raw_lines: List[str] = []
+    physical_lines: List[int] = []
     for line_no, physical_line in enumerate(data.split(b"\n"), 1):
         line_bytes = physical_line[:-1] if physical_line.endswith(b"\r") else physical_line
         if line_no == 1 and line_bytes.startswith(b"\xef\xbb\xbf"):
@@ -1866,6 +1871,12 @@ def parse_jsonl_bytes(data: bytes, source_label: str = "JSONL") -> Tuple[List[Js
             raise ValueError(f"line {line_no} is JSON but not an object")
         records.append(obj)
         raw_lines.append(line)
+        physical_lines.append(line_no)
+    return records, raw_lines, physical_lines
+
+
+def parse_jsonl_bytes(data: bytes, source_label: str = "JSONL") -> Tuple[List[JsonObj], List[str]]:
+    records, raw_lines, _physical_lines = parse_jsonl_bytes_with_lines(data, source_label=source_label)
     return records, raw_lines
 
 
@@ -2383,6 +2394,109 @@ def stable_digest(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
 
 
+def _bounded_diagnostic_label(value: Any, *, missing: bool = False) -> str:
+    """Render schema metadata for reports without copying arbitrary JSON values."""
+    if missing:
+        return "<missing>"
+    if isinstance(value, str):
+        if len(value) > MAX_PUBLIC_DIAGNOSTIC_STRING_CHARS:
+            return f"<string:length={len(value)};sha256={stable_digest(value)}>"
+        return f"<{value}" if value.startswith("<") else value
+    if value is None:
+        return "<null>"
+    return f"<invalid:{type(value).__name__}>"
+
+
+def _long_diagnostic_strings(value: Any) -> List[str]:
+    """Collect source strings that must not be copied into public diagnostics."""
+    found: set = set()
+
+    def visit(item: Any) -> None:
+        if isinstance(item, str):
+            if len(item) > MAX_PUBLIC_DIAGNOSTIC_STRING_CHARS:
+                found.add(item)
+        elif isinstance(item, dict):
+            for key, nested in item.items():
+                visit(key)
+                visit(nested)
+        elif isinstance(item, (list, tuple)):
+            for nested in item:
+                visit(nested)
+
+    visit(value)
+    return sorted(found, key=len, reverse=True)
+
+
+def _redact_public_diagnostic_text(text: str, redactions: Sequence[str]) -> Tuple[str, bool]:
+    """Replace exact/repr/JSON renderings of oversized source values in text."""
+    redacted = text
+    replaced = False
+    for raw in redactions:
+        label = _bounded_diagnostic_label(raw)
+        for source, replacement in (
+            (raw, label),
+            (repr(raw), repr(label)),
+            (json.dumps(raw, ensure_ascii=False), json.dumps(label, ensure_ascii=False)),
+        ):
+            if source in redacted:
+                redacted = redacted.replace(source, replacement)
+                replaced = True
+    return redacted, replaced
+
+
+def _bounded_public_diagnostic_structure(
+    value: Any,
+    *,
+    redactions: Sequence[str] = (),
+    diagnostic_text: bool = False,
+    redact_unmatched_diagnostic_text: bool = False,
+) -> Any:
+    """Bound oversized fields while retaining ordinary human-readable diagnostics."""
+    if isinstance(value, str):
+        if diagnostic_text:
+            redacted, replaced = _redact_public_diagnostic_text(value, redactions)
+            if replaced or not redact_unmatched_diagnostic_text:
+                return redacted
+            return _bounded_diagnostic_label(value) if len(value) > MAX_PUBLIC_DIAGNOSTIC_STRING_CHARS else value
+        return _bounded_diagnostic_label(value) if len(value) > MAX_PUBLIC_DIAGNOSTIC_STRING_CHARS else value
+    if isinstance(value, list):
+        return [
+            _bounded_public_diagnostic_structure(
+                item,
+                redactions=redactions,
+                diagnostic_text=diagnostic_text,
+                redact_unmatched_diagnostic_text=redact_unmatched_diagnostic_text,
+            )
+            for item in value
+        ]
+    if isinstance(value, tuple):
+        return tuple(
+            _bounded_public_diagnostic_structure(
+                item,
+                redactions=redactions,
+                diagnostic_text=diagnostic_text,
+                redact_unmatched_diagnostic_text=redact_unmatched_diagnostic_text,
+            )
+            for item in value
+        )
+    if isinstance(value, dict):
+        projected: Dict[Any, Any] = {}
+        for key, item in value.items():
+            public_key = (
+                _bounded_diagnostic_label(key)
+                if isinstance(key, str) and len(key) > MAX_PUBLIC_DIAGNOSTIC_STRING_CHARS
+                else key
+            )
+            projected[public_key] = _bounded_public_diagnostic_structure(
+                item,
+                redactions=redactions,
+                diagnostic_text=diagnostic_text or key in {"errors", "warnings"},
+                redact_unmatched_diagnostic_text=redact_unmatched_diagnostic_text,
+            )
+        return projected
+    return value
+
+
 def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -2458,6 +2572,12 @@ def is_noisy_text(text: str) -> bool:
 def one_line(text: str, limit: int = 220) -> str:
     text = re.sub(r"\s+", " ", str(text)).strip()
     return truncate(text, limit).replace("\n", " ")
+
+
+def _bounded_diagnostic_text(value: Any, limit: int = 1200) -> str:
+    if isinstance(value, str):
+        return one_line(truncate(value, limit), limit)
+    return _bounded_diagnostic_label(value)
 
 
 def block_text(block: Any) -> str:
@@ -2576,7 +2696,14 @@ def record_text(obj: JsonObj) -> str:
     if t == "attachment":
         return attachment_text(obj)
     if t == "system":
-        return " ".join(str(obj.get(k, "")) for k in ("subtype", "content", "error") if obj.get(k))
+        pieces: List[str] = []
+        if "subtype" in obj and obj.get("subtype") not in (None, ""):
+            pieces.append(_bounded_diagnostic_label(obj.get("subtype")))
+        for key in ("content", "error"):
+            value = obj.get(key)
+            if value not in (None, ""):
+                pieces.append(_bounded_diagnostic_text(value))
+        return " ".join(pieces)
     if t == "file-history-snapshot":
         snap = obj.get("snapshot")
         if isinstance(snap, dict):
@@ -2716,7 +2843,12 @@ def ordered_subsequence(items: Sequence[str], expected: Sequence[str]) -> bool:
 
 
 def is_api_message(obj: JsonObj) -> bool:
-    return obj.get("type") in {"user", "assistant"} and isinstance(obj.get("message"), dict)
+    record_type = obj.get("type")
+    return (
+        isinstance(record_type, str)
+        and record_type in {"user", "assistant"}
+        and isinstance(obj.get("message"), dict)
+    )
 
 
 def api_role(obj: JsonObj) -> Optional[str]:
@@ -3184,6 +3316,7 @@ def require_resume_leaf_info(
 def public_resume_leaf_info(info: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if info is None:
         return None
+    redactions = _long_diagnostic_strings(info)
     public = copy.deepcopy(info)
     public.pop("lastPromptTemplate", None)
     active_indexes = public.pop("activeChainIndexes", [])
@@ -3191,7 +3324,40 @@ def public_resume_leaf_info(info: Optional[Dict[str, Any]]) -> Optional[Dict[str
     public["activeChainRecordCount"] = len(active_indexes)
     public["activeChainLinesDigest"] = stable_digest(",".join(str(int(idx) + 1) for idx in active_indexes))
     public["activeChainUuidsDigest"] = stable_digest(",".join(str(uid) for uid in active_uuids))
-    return public
+    for key in (
+        "promptLeafUuid",
+        "physicalLeafUuid",
+        "selectedLeafUuid",
+        "promptChainMissingUuid",
+        "promptChainLoopUuid",
+        "promptChainMalformedParentUuid",
+        "authoritySessionId",
+        "currentSessionId",
+    ):
+        if key in public and public[key] is not None:
+            public[key] = _bounded_diagnostic_label(public[key])
+    for key in ("duplicateUuids", "postLastPromptExtensionUuids"):
+        values = public.get(key)
+        if isinstance(values, list):
+            public[key] = [_bounded_diagnostic_label(value) for value in values]
+    return _bounded_public_diagnostic_structure(
+        public,
+        redactions=redactions,
+        redact_unmatched_diagnostic_text=True,
+    )
+
+
+def public_parent_repair_details(repairs: Sequence[JsonObj]) -> List[JsonObj]:
+    """Project repair diagnostics without copying arbitrary metadata verbatim."""
+    redactions = _long_diagnostic_strings(repairs)
+    public: List[JsonObj] = []
+    for repair in repairs:
+        projected = copy.deepcopy(repair)
+        for key in ("uuid", "type", "sessionId", "oldParentUuid", "newParentUuid"):
+            if key in projected and projected[key] is not None:
+                projected[key] = _bounded_diagnostic_label(projected[key])
+        public.append(projected)
+    return _bounded_public_diagnostic_structure(public, redactions=redactions)
 
 
 def choose_resume_leaf(records: Sequence[JsonObj]) -> Optional[str]:
@@ -3291,7 +3457,7 @@ def select_control_projection_indexes(records: Sequence[JsonObj]) -> List[int]:
     ui_types = {"mode", "permission-mode", "custom-title", "ai-title", "agent-name"}
     selected = [
         idx for idx, obj in enumerate(records[:first_uuid_index])
-        if obj.get("type") in ui_types and "uuid" not in obj
+        if isinstance(obj.get("type"), str) and obj.get("type") in ui_types and "uuid" not in obj
     ]
     selected.extend(idx for idx, obj in enumerate(records) if obj.get("type") == "last-prompt")
     return sorted(set(selected))
@@ -3448,7 +3614,10 @@ def merge_assistant_fragments(api_records: Sequence[JsonObj]) -> List[JsonObj]:
             if isinstance(target_msg, dict) and isinstance(obj_msg, dict):
                 target_blocks = content_blocks(target)
                 obj_blocks = content_blocks(obj)
+                target_content_lines = _validation_content_lines(target, target.get("_line"))
+                obj_content_lines = _validation_content_lines(obj, obj.get("_line"))
                 target_msg["content"] = target_blocks + obj_blocks
+                target["_validationContentLines"] = target_content_lines + obj_content_lines
                 if isinstance(obj.get("uuid"), str):
                     target["uuid"] = obj.get("uuid")
                 merged_lines = list(target.get("_mergedLines", []))
@@ -3515,10 +3684,12 @@ def merge_split_tool_result_users(api_records: Sequence[JsonObj]) -> List[JsonOb
         combined_msg = combined.get("message")
         if isinstance(combined_msg, dict):
             blocks: List[Any] = []
+            content_lines: List[int] = []
             merged_lines: List[Any] = []
             merged_uuids: List[str] = []
             for user_obj in group:
                 blocks.extend(content_blocks(user_obj))
+                content_lines.extend(_validation_content_lines(user_obj, user_obj.get("_line")))
                 merged_lines.append(user_obj.get("_line"))
                 if isinstance(user_obj.get("uuid"), str):
                     merged_uuids.append(user_obj.get("uuid"))
@@ -3526,6 +3697,7 @@ def merge_split_tool_result_users(api_records: Sequence[JsonObj]) -> List[JsonOb
             last_user = group[-1]
             if isinstance(last_user.get("uuid"), str):
                 combined["uuid"] = last_user.get("uuid")
+            combined["_validationContentLines"] = content_lines
             combined["_mergedLines"] = merged_lines
             if merged_uuids:
                 combined["_mergedUuids"] = merged_uuids
@@ -3534,15 +3706,102 @@ def merge_split_tool_result_users(api_records: Sequence[JsonObj]) -> List[JsonOb
     return merged
 
 
-def active_api_messages_for_validation(records: Sequence[JsonObj]) -> List[Tuple[int, JsonObj]]:
+def _validated_record_lines(
+    records: Sequence[JsonObj],
+    physical_lines: Optional[Sequence[int]] = None,
+    *,
+    allow_nonmonotonic: bool = False,
+) -> List[int]:
+    if physical_lines is None:
+        return list(range(1, len(records) + 1))
+    lines = list(physical_lines)
+    if len(lines) != len(records):
+        raise ValueError("physical line map length does not match record count")
+    previous = 0
+    for line in lines:
+        if isinstance(line, bool) or not isinstance(line, int) or line <= 0:
+            raise ValueError("physical line map must contain positive integers")
+        if not allow_nonmonotonic and line <= previous:
+            raise ValueError("physical line map must contain strictly increasing positive integers")
+        previous = line
+    return lines
+
+
+def _diagnostic_counter_label(obj: JsonObj, key: str) -> str:
+    return _bounded_diagnostic_label(obj.get(key), missing=key not in obj)
+
+
+def _validation_content_lines(obj: JsonObj, fallback_line: Any) -> List[int]:
+    if isinstance(fallback_line, bool) or not isinstance(fallback_line, int) or fallback_line <= 0:
+        fallback_line = 1
+    blocks = content_blocks(obj)
+    candidate = obj.get("_validationContentLines")
+    if (
+        isinstance(candidate, list)
+        and len(candidate) == len(blocks)
+        and all(isinstance(line, int) and not isinstance(line, bool) and line > 0 for line in candidate)
+    ):
+        return list(candidate)
+    return [fallback_line] * len(blocks)
+
+
+def _first_validation_block_line(obj: JsonObj, block_type: str, fallback_line: int) -> int:
+    block_lines = _validation_content_lines(obj, fallback_line)
+    for index, block in enumerate(content_blocks(obj)):
+        if isinstance(block, dict) and block.get("type") == block_type:
+            return block_lines[index]
+    return fallback_line
+
+
+def _ordered_subsequence_failure_line(
+    obj: JsonObj,
+    expected: Sequence[str],
+    fallback_line: int,
+) -> int:
+    block_lines = _validation_content_lines(obj, fallback_line)
+    position = 0
+    for index, block in enumerate(content_blocks(obj)):
+        if not isinstance(block, dict) or block.get("type") != "tool_result":
+            continue
+        tool_id = block.get("tool_use_id") or block.get("toolUseID")
+        if not isinstance(tool_id, str):
+            continue
+        while position < len(expected) and expected[position] != tool_id:
+            position += 1
+        if position >= len(expected):
+            return block_lines[index]
+        position += 1
+    return fallback_line
+
+
+def active_api_messages_for_validation(
+    records: Sequence[JsonObj],
+    physical_lines: Optional[Sequence[int]] = None,
+    *,
+    allow_nonmonotonic_diagnostic_lines: bool = False,
+) -> List[Tuple[int, JsonObj]]:
+    record_lines = _validated_record_lines(
+        records,
+        physical_lines,
+        allow_nonmonotonic=allow_nonmonotonic_diagnostic_lines,
+    )
+    resume_info = choose_resume_leaf_info(records)
+    active_indexes = list(resume_info.get("activeChainIndexes") or []) if resume_info.get("ok") else []
     api_records: List[JsonObj] = []
-    for idx, obj in enumerate(active_chain_records(records), 1):
+    for record_index in active_indexes:
+        obj = records[record_index]
         if not is_api_message(obj):
             continue
-        clone = obj if "_line" in obj else {**obj, "_line": idx}
+        clone = {
+            key: value
+            for key, value in obj.items()
+            if key not in {"_line", "_mergedLines", "_mergedUuids", "_validationContentLines"}
+        }
+        clone["_line"] = record_lines[record_index]
+        clone["_validationContentLines"] = [record_lines[record_index]] * len(content_blocks(obj))
         api_records.append(clone)
     merged = merge_split_tool_result_users(merge_assistant_fragments(api_records))
-    return [(int(obj.get("_line") or idx), obj) for idx, obj in enumerate(merged, 1)]
+    return [(obj["_line"], obj) for obj in merged]
 
 
 def adjust_recent_start_for_tool_pairs(records: Sequence[JsonObj], start: int) -> int:
@@ -3837,11 +4096,13 @@ def is_assistant_research_decision(obj: JsonObj, text: Optional[str] = None) -> 
 
 def collect_summary_inputs(records: Sequence[JsonObj]) -> Dict[str, Any]:
     ensure_summary_resources()
-    type_counts = collections.Counter(obj.get("type", "<missing>") for obj in records)
+    type_counts = collections.Counter(_diagnostic_counter_label(obj, "type") for obj in records)
     subtype_counts = collections.Counter(
-        f"{obj.get('type')}:{obj.get('subtype')}" for obj in records if obj.get("subtype")
+        f"{_diagnostic_counter_label(obj, 'type')}:{_diagnostic_counter_label(obj, 'subtype')}"
+        for obj in records
+        if "subtype" in obj and obj.get("subtype") not in (None, "")
     )
-    session_counts = collections.Counter(obj.get("sessionId", "<missing>") for obj in records)
+    session_counts = collections.Counter(_diagnostic_counter_label(obj, "sessionId") for obj in records)
     cwd_counts = collections.Counter(str(obj.get("cwd")) for obj in records if obj.get("cwd"))
     versions = collections.Counter(str(obj.get("version")) for obj in records if obj.get("version"))
     tools = collections.Counter()
@@ -3907,7 +4168,11 @@ def collect_summary_inputs(records: Sequence[JsonObj]) -> Dict[str, Any]:
                 user_items.append((idx, one_line(txt, 700 if is_important else 420)))
         elif obj.get("type") == "system":
             if obj.get("subtype") == "api_error" or obj.get("error"):
-                errors.append((idx, one_line(txt or json.dumps(obj, ensure_ascii=False), 520)))
+                fallback = (
+                    f"system-error type={_diagnostic_counter_label(obj, 'type')} "
+                    f"subtype={_diagnostic_counter_label(obj, 'subtype')}"
+                )
+                errors.append((idx, one_line(txt or fallback, 520)))
         elif obj.get("type") == "attachment":
             att = obj.get("attachment")
             if isinstance(att, dict):
@@ -4202,7 +4467,7 @@ def make_summary_text(
     all_info = collect_summary_inputs(omitted)
     early_info = collect_summary_inputs(early)
     middle_info = collect_summary_inputs(middle)
-    kept_types = collections.Counter(obj.get("type", "<missing>") for obj in kept)
+    kept_types = collections.Counter(_diagnostic_counter_label(obj, "type") for obj in kept)
     first_ts = next((obj.get("timestamp") for obj in omitted if obj.get("timestamp")), "unknown")
     last_omitted_ts = next((obj.get("timestamp") for obj in reversed(omitted) if obj.get("timestamp")), "unknown")
     first_kept_ts = next((obj.get("timestamp") for obj in kept if obj.get("timestamp")), "unknown")
@@ -4880,10 +5145,12 @@ def model_evidence_record(obj: JsonObj, original_line: int) -> Optional[Dict[str
     noisy = is_noisy_text(txt)
     if not txt or (noisy and not mandatory_semantic and not is_prior_summary):
         return None
-    role = api_role(obj) or str(obj.get("type", "<missing>"))
+    record_type = _diagnostic_counter_label(obj, "type")
+    role_value = api_role(obj)
+    role = _bounded_diagnostic_label(role_value) if role_value is not None else record_type
     timestamp = obj.get("timestamp") or ""
     uid = obj.get("uuid") or ""
-    prefix = f"L{original_line} type={obj.get('type')} role={role}"
+    prefix = f"L{original_line} type={record_type} role={role}"
     if timestamp:
         prefix += f" ts={timestamp}"
     if uid:
@@ -5883,8 +6150,8 @@ def summarize_active_chain_window(records: Sequence[JsonObj], summary_uuid: str)
     uuids = [obj.get("uuid") for obj in chain if isinstance(obj.get("uuid"), str)]
     summary_pos = next((idx for idx, obj in enumerate(chain) if obj.get("uuid") == summary_uuid), None)
     after_summary = chain[summary_pos + 1 :] if isinstance(summary_pos, int) else []
-    session_counts = collections.Counter(obj.get("sessionId", "<missing>") for obj in chain)
-    type_counts = collections.Counter(obj.get("type", "<missing>") for obj in chain)
+    session_counts = collections.Counter(_diagnostic_counter_label(obj, "sessionId") for obj in chain)
+    type_counts = collections.Counter(_diagnostic_counter_label(obj, "type") for obj in chain)
     return {
         "leafUuid": latest_leaf,
         "chainLength": len(chain),
@@ -6017,8 +6284,11 @@ def select_preservation_plan(
 def validate_source_active_chain_for_plan(
     records: Sequence[JsonObj],
     plan: Dict[str, Any],
+    *,
+    physical_lines: Optional[Sequence[int]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Validate the authoritative logical chain without inspecting inactive branches."""
+    source_lines = _validated_record_lines(records, physical_lines)
     preserve_info = plan.get("preserve_info")
     if not isinstance(preserve_info, dict):
         return None
@@ -6028,7 +6298,16 @@ def validate_source_active_chain_for_plan(
     active_indexes = list(resume_info.get("activeChainIndexes") or [])
     if not active_indexes:
         raise ValueError("source active-chain validation failed: authoritative chain is empty")
-    active_records = [copy.deepcopy(records[int(idx)]) for idx in active_indexes]
+    if any(
+        isinstance(index, bool)
+        or not isinstance(index, int)
+        or index < 0
+        or index >= len(records)
+        for index in active_indexes
+    ):
+        raise ValueError("source active-chain validation failed: preservation plan has invalid active-chain indexes")
+    active_records = [copy.deepcopy(records[index]) for index in active_indexes]
+    active_record_lines = [source_lines[index] for index in active_indexes]
     selected_leaf = plan.get("selected_leaf_uuid")
     if not isinstance(selected_leaf, str) or not selected_leaf:
         raise ValueError("source active-chain validation failed: selected leaf is missing")
@@ -6047,7 +6326,17 @@ def validate_source_active_chain_for_plan(
     if isinstance(leaf_session, str) and leaf_session:
         pointer["sessionId"] = leaf_session
     active_records.append(pointer)
-    validation = validate_records(active_records)
+    pointer_index = resume_info.get("lastPromptIndex")
+    if isinstance(pointer_index, int) and not isinstance(pointer_index, bool) and 0 <= pointer_index < len(records):
+        pointer_line = source_lines[pointer_index]
+    else:
+        pointer_line = max(source_lines, default=0) + 1
+    active_record_lines.append(pointer_line)
+    validation = validate_records(
+        active_records,
+        physical_lines=active_record_lines,
+        allow_nonmonotonic_diagnostic_lines=True,
+    )
     if not validation.get("ok"):
         raise ValueError(
             "source active-chain validation failed: "
@@ -6078,7 +6367,7 @@ def build_model_summary_pack_for_input(
     if handoff_summary_path is not None and is_under_claude_root(handoff_summary_path):
         raise ValueError("--handoff-summary process files must be outside the entire .claude directory")
     source_bytes = input_path.read_bytes()
-    records, raw_lines = parse_jsonl_bytes(source_bytes, source_label=str(input_path))
+    records, raw_lines, physical_lines = parse_jsonl_bytes_with_lines(source_bytes, source_label=str(input_path))
     if not records:
         raise ValueError("input JSONL has no records")
     input_bytes = len(source_bytes)
@@ -6098,7 +6387,11 @@ def build_model_summary_pack_for_input(
         checkpoint_policy,
         resume_leaf_override,
     )
-    source_active_chain_validation = validate_source_active_chain_for_plan(records, plan)
+    source_active_chain_validation = validate_source_active_chain_for_plan(
+        records,
+        plan,
+        physical_lines=physical_lines,
+    )
     source_sha256 = sha256_hex(source_bytes)
     source_digest = source_sha256
     omitted_digest = sha256_hex("\n".join(raw_lines[idx] for idx in plan["omitted_indexes"]).encode("utf-8"))
@@ -6237,7 +6530,7 @@ def compress_jsonl(
     if model_summary_path is not None and deterministic_summary:
         raise ValueError("model_summary_path and deterministic_summary=True are mutually exclusive")
     source_bytes = input_path.read_bytes()
-    records, raw_lines = parse_jsonl_bytes(source_bytes, source_label=str(input_path))
+    records, raw_lines, physical_lines = parse_jsonl_bytes_with_lines(source_bytes, source_label=str(input_path))
     if not records:
         raise ValueError("input JSONL has no records")
     input_bytes = len(source_bytes)
@@ -6275,7 +6568,11 @@ def compress_jsonl(
         checkpoint_policy,
         resume_leaf_override,
     )
-    source_active_chain_validation = validate_source_active_chain_for_plan(records, plan)
+    source_active_chain_validation = validate_source_active_chain_for_plan(
+        records,
+        plan,
+        physical_lines=physical_lines,
+    )
     preserve_info = plan["preserve_info"]
     omitted = list(plan["omitted"])
     kept_original = list(plan["kept_original"])
@@ -6583,7 +6880,7 @@ def compress_jsonl(
         "omitted_digest": omitted_text_digest,
         "safe_prefix_records": len(safe_prefix),
         "parent_repairs": len(parent_repair_details),
-        "parent_repair_details": parent_repair_details,
+        "parent_repair_details": public_parent_repair_details(parent_repair_details),
         "last_prompt_updates": last_prompt_updates,
         "target_session_id": target_session_id,
         "normalized_session_records": normalized_session_records,
@@ -6602,35 +6899,50 @@ def compress_jsonl(
     return report
 
 
-def validate_records(records: Sequence[JsonObj]) -> Dict[str, Any]:
+def validate_records(
+    records: Sequence[JsonObj],
+    physical_lines: Optional[Sequence[int]] = None,
+    *,
+    allow_nonmonotonic_diagnostic_lines: bool = False,
+) -> Dict[str, Any]:
     errors: List[str] = []
     warnings: List[str] = []
+    record_lines = _validated_record_lines(
+        records,
+        physical_lines,
+        allow_nonmonotonic=allow_nonmonotonic_diagnostic_lines,
+    )
     uuid_counts = collections.Counter(obj.get("uuid") for obj in records if isinstance(obj.get("uuid"), str))
     duplicates = sorted(k for k, v in uuid_counts.items() if v > 1)
     if duplicates:
         errors.append(f"duplicate UUIDs: {duplicates[:20]}")
     uuid_set = set(uuid_counts)
     uuid_to_record = {obj.get("uuid"): obj for obj in records if isinstance(obj.get("uuid"), str)}
-    uuid_to_line = {obj.get("uuid"): idx for idx, obj in enumerate(records, 1) if isinstance(obj.get("uuid"), str)}
+    uuid_to_line = {
+        obj.get("uuid"): record_lines[index]
+        for index, obj in enumerate(records)
+        if isinstance(obj.get("uuid"), str)
+    }
     missing_parent: List[Tuple[int, str]] = []
     malformed_parent: List[JsonObj] = []
     cross_session_parent: List[JsonObj] = []
-    for idx, obj in enumerate(records, 1):
+    for record_index, obj in enumerate(records):
+        line = record_lines[record_index]
         parent = obj.get("parentUuid")
         if parent is None:
             continue
         if not isinstance(parent, str) or not parent:
             malformed_parent.append(
                 {
-                    "line": idx,
+                    "line": line,
                     "uuid": obj.get("uuid"),
-                    "type": obj.get("type"),
+                    "type": _diagnostic_counter_label(obj, "type"),
                     "parentUuidType": type(parent).__name__,
                 }
             )
             continue
         if parent not in uuid_set:
-            missing_parent.append((idx, str(parent)))
+            missing_parent.append((line, str(parent)))
         else:
             parent_obj = uuid_to_record.get(parent)
             child_session = obj.get("sessionId")
@@ -6638,12 +6950,12 @@ def validate_records(records: Sequence[JsonObj]) -> Dict[str, Any]:
             if isinstance(child_session, str) and isinstance(parent_session, str) and child_session != parent_session:
                 cross_session_parent.append(
                     {
-                        "line": idx,
+                        "line": line,
                         "uuid": obj.get("uuid"),
-                        "type": obj.get("type"),
-                        "sessionId": child_session,
+                        "type": _diagnostic_counter_label(obj, "type"),
+                        "sessionId": _diagnostic_counter_label(obj, "sessionId"),
                         "parentUuid": parent,
-                        "parentSessionId": parent_session,
+                        "parentSessionId": _bounded_diagnostic_label(parent_session),
                     }
                 )
     if malformed_parent:
@@ -6651,7 +6963,9 @@ def validate_records(records: Sequence[JsonObj]) -> Dict[str, Any]:
     if missing_parent:
         errors.append(f"missing parentUuid references: {missing_parent[:30]}")
     last_prompt_records = [
-        (idx, obj) for idx, obj in enumerate(records, 1) if obj.get("type") == "last-prompt"
+        (record_lines[index], obj)
+        for index, obj in enumerate(records)
+        if obj.get("type") == "last-prompt"
     ]
     last_prompt_malformed: List[JsonObj] = []
     last_prompt_missing: List[JsonObj] = []
@@ -6660,12 +6974,22 @@ def validate_records(records: Sequence[JsonObj]) -> Dict[str, Any]:
         leaf = obj.get("leafUuid")
         if not isinstance(leaf, str) or not leaf:
             last_prompt_malformed.append(
-                {"line": idx, "leafUuidType": type(leaf).__name__, "sessionId": obj.get("sessionId")}
+                {
+                    "line": idx,
+                    "leafUuidType": type(leaf).__name__,
+                    "sessionId": _diagnostic_counter_label(obj, "sessionId"),
+                }
             )
             continue
         target = uuid_to_record.get(leaf)
         if target is None:
-            last_prompt_missing.append({"line": idx, "leafUuid": leaf, "sessionId": obj.get("sessionId")})
+            last_prompt_missing.append(
+                {
+                    "line": idx,
+                    "leafUuid": _bounded_diagnostic_label(leaf),
+                    "sessionId": _diagnostic_counter_label(obj, "sessionId"),
+                }
+            )
             continue
         lp_session = obj.get("sessionId")
         target_session = target.get("sessionId")
@@ -6673,9 +6997,9 @@ def validate_records(records: Sequence[JsonObj]) -> Dict[str, Any]:
             last_prompt_cross_session.append(
                 {
                     "line": idx,
-                    "leafUuid": leaf,
-                    "sessionId": lp_session,
-                    "leafSessionId": target_session,
+                    "leafUuid": _bounded_diagnostic_label(leaf),
+                    "sessionId": _bounded_diagnostic_label(lp_session),
+                    "leafSessionId": _bounded_diagnostic_label(target_session),
                 }
             )
     if last_prompt_missing:
@@ -6683,7 +7007,7 @@ def validate_records(records: Sequence[JsonObj]) -> Dict[str, Any]:
     if last_prompt_cross_session:
         errors.append(f"last-prompt leafUuid cross-session targets: {last_prompt_cross_session[:20]}")
     physical_last_prompt = latest_last_prompt_entry(records)
-    physical_last_prompt_line = physical_last_prompt[0] + 1 if physical_last_prompt else None
+    physical_last_prompt_line = record_lines[physical_last_prompt[0]] if physical_last_prompt else None
     physical_last_prompt_malformed = bool(
         physical_last_prompt
         and (not isinstance(physical_last_prompt[1].get("leafUuid"), str) or not physical_last_prompt[1].get("leafUuid"))
@@ -6694,32 +7018,38 @@ def validate_records(records: Sequence[JsonObj]) -> Dict[str, Any]:
         )
     elif last_prompt_malformed:
         warnings.append(f"earlier malformed last-prompt records: {last_prompt_malformed[:20]}")
-    api_messages = active_api_messages_for_validation(records)
+    api_messages = active_api_messages_for_validation(
+        records,
+        physical_lines=record_lines,
+        allow_nonmonotonic_diagnostic_lines=allow_nonmonotonic_diagnostic_lines,
+    )
     tool_pair_errors: List[JsonObj] = []
     tool_pair_partial_result_count = 0
     tool_use_occurrences: Dict[str, List[int]] = collections.defaultdict(list)
     tool_result_occurrences: Dict[str, List[int]] = collections.defaultdict(list)
     malformed_tool_id_samples: List[JsonObj] = []
     for line, api_obj in api_messages:
-        for block in content_blocks(api_obj):
+        block_lines = _validation_content_lines(api_obj, line)
+        for block_index, block in enumerate(content_blocks(api_obj)):
             if not isinstance(block, dict):
                 continue
+            block_line = block_lines[block_index]
             if block.get("type") == "tool_use":
                 tool_id = block.get("id")
                 if not isinstance(tool_id, str) or not tool_id:
                     malformed_tool_id_samples.append(
-                        {"line": line, "kind": "tool_use", "idType": type(tool_id).__name__}
+                        {"line": block_line, "kind": "tool_use", "idType": type(tool_id).__name__}
                     )
                 else:
-                    tool_use_occurrences[tool_id].append(line)
+                    tool_use_occurrences[tool_id].append(block_line)
             elif block.get("type") == "tool_result":
                 tool_id = block.get("tool_use_id") or block.get("toolUseID")
                 if not isinstance(tool_id, str) or not tool_id:
                     malformed_tool_id_samples.append(
-                        {"line": line, "kind": "tool_result", "idType": type(tool_id).__name__}
+                        {"line": block_line, "kind": "tool_result", "idType": type(tool_id).__name__}
                     )
                 else:
-                    tool_result_occurrences[tool_id].append(line)
+                    tool_result_occurrences[tool_id].append(block_line)
     duplicate_tool_use_ids = {
         tool_id: lines for tool_id, lines in tool_use_occurrences.items() if len(lines) > 1
     }
@@ -6756,21 +7086,24 @@ def validate_records(records: Sequence[JsonObj]) -> Dict[str, Any]:
     for pos, (line, obj) in enumerate(api_messages):
         uses = tool_use_ids(obj)
         results = tool_result_ids(obj)
+        tool_use_line = _first_validation_block_line(obj, "tool_use", line)
+        tool_result_line = _first_validation_block_line(obj, "tool_result", line)
         if uses:
             if pos + 1 >= len(api_messages):
                 tool_pair_errors.append(
-                    {"line": line, "uuid": obj.get("uuid"), "reason": "assistant tool_use is final api message", "toolUseIds": uses}
+                    {"line": tool_use_line, "uuid": obj.get("uuid"), "reason": "assistant tool_use is final api message", "toolUseIds": uses}
                 )
             else:
                 next_line, next_obj = api_messages[pos + 1]
                 next_results = tool_result_ids(next_obj)
+                next_result_line = _first_validation_block_line(next_obj, "tool_result", next_line)
                 if api_role(next_obj) != "user":
                     tool_pair_errors.append(
                         {
-                            "line": line,
+                            "line": tool_use_line,
                             "uuid": obj.get("uuid"),
                             "reason": "assistant tool_use not followed by user message",
-                            "nextLine": next_line,
+                            "nextLine": next_result_line,
                             "nextRole": api_role(next_obj),
                             "toolUseIds": uses,
                         }
@@ -6778,11 +7111,11 @@ def validate_records(records: Sequence[JsonObj]) -> Dict[str, Any]:
                 elif not ordered_subsequence(next_results, uses):
                     tool_pair_errors.append(
                         {
-                            "line": line,
+                            "line": tool_use_line,
                             "uuid": obj.get("uuid"),
                             "reason": "assistant tool_use ids do not contain next user tool_result ids in order",
                             "toolUseIds": uses,
-                            "nextLine": next_line,
+                            "nextLine": _ordered_subsequence_failure_line(next_obj, uses, next_result_line),
                             "nextToolResultIds": next_results,
                         }
                     )
@@ -6791,7 +7124,7 @@ def validate_records(records: Sequence[JsonObj]) -> Dict[str, Any]:
         if results:
             if pos == 0:
                 tool_pair_errors.append(
-                    {"line": line, "uuid": obj.get("uuid"), "reason": "user tool_result is first api message", "toolResultIds": results}
+                    {"line": tool_result_line, "uuid": obj.get("uuid"), "reason": "user tool_result is first api message", "toolResultIds": results}
                 )
             else:
                 source_uuid = source_tool_assistant_uuid(obj)
@@ -6801,26 +7134,33 @@ def validate_records(records: Sequence[JsonObj]) -> Dict[str, Any]:
                     source_uses = tool_use_ids(source_obj) if isinstance(source_obj, dict) else []
                 prev_line, prev_obj = api_messages[pos - 1]
                 prev_uses = tool_use_ids(prev_obj)
+                prev_tool_use_line = _first_validation_block_line(prev_obj, "tool_use", prev_line)
                 matches_prev = api_role(prev_obj) == "assistant" and ordered_subsequence(results, prev_uses)
                 matches_source = ordered_subsequence(results, source_uses)
                 if not matches_prev and not matches_source:
+                    expected_uses = source_uses or prev_uses
                     tool_pair_errors.append(
                         {
-                            "line": line,
+                            "line": _ordered_subsequence_failure_line(obj, expected_uses, tool_result_line),
                             "uuid": obj.get("uuid"),
                             "reason": "user tool_result ids are not an ordered subset of previous/linked assistant tool_use ids",
                             "toolResultIds": results,
-                            "prevLine": prev_line,
+                            "prevLine": prev_tool_use_line,
                             "prevToolUseIds": prev_uses,
                             "sourceToolAssistantUUID": source_uuid,
                             "sourceToolUseIds": source_uses,
                         }
                     )
             types = [block.get("type") if isinstance(block, dict) else type(block).__name__ for block in content_blocks(obj)]
-            if any(kind != "tool_result" for kind in types[: len(results)]):
+            misplaced_index = next(
+                (index for index, kind in enumerate(types[: len(results)]) if kind != "tool_result"),
+                None,
+            )
+            if misplaced_index is not None:
+                content_lines = _validation_content_lines(obj, line)
                 tool_pair_errors.append(
                     {
-                        "line": line,
+                        "line": content_lines[misplaced_index],
                         "uuid": obj.get("uuid"),
                         "reason": "tool_result blocks are not first in user message content",
                         "blockTypes": types[:10],
@@ -7086,7 +7426,9 @@ def validate_records(records: Sequence[JsonObj]) -> Dict[str, Any]:
     )
     active_chain_has_compact_summary = any(obj.get("isCompactSummary") is True for obj in active_chain)
     active_chain_uuid_set = {obj.get("uuid") for obj in active_chain if isinstance(obj.get("uuid"), str)}
-    active_chain_sessions = collections.Counter(obj.get("sessionId", "<missing>") for obj in active_chain)
+    active_chain_sessions = collections.Counter(
+        _diagnostic_counter_label(obj, "sessionId") for obj in active_chain
+    )
     compact_metadata_chain_mismatch: List[JsonObj] = []
     for boundary in compact_boundaries:
         metadata = boundary.get("compactMetadata")
@@ -7200,9 +7542,9 @@ def validate_records(records: Sequence[JsonObj]) -> Dict[str, Any]:
             "compactMetadata historical preserved snapshot diverges from the current active chain: "
             f"{len(compact_metadata_chain_mismatch)} item(s)"
         )
-    type_counts = collections.Counter(obj.get("type", "<missing>") for obj in records)
-    session_counts = collections.Counter(obj.get("sessionId", "<missing>") for obj in records)
-    return {
+    type_counts = collections.Counter(_diagnostic_counter_label(obj, "type") for obj in records)
+    session_counts = collections.Counter(_diagnostic_counter_label(obj, "sessionId") for obj in records)
+    validation = {
         "ok": not errors,
         "errors": errors,
         "warnings": warnings,
@@ -7257,10 +7599,22 @@ def validate_records(records: Sequence[JsonObj]) -> Dict[str, Any]:
         "compact_metadata_chain_mismatch_count": len(compact_metadata_chain_mismatch),
         "compact_metadata_chain_mismatch_samples": compact_metadata_chain_mismatch[:20],
         "latest_last_prompt_line": latest_last_prompt_line,
-        "latest_last_prompt_session_id": latest_last_prompt_session,
-        "latest_last_prompt_leaf_uuid": latest_last_prompt_leaf,
+        "latest_last_prompt_session_id": (
+            _bounded_diagnostic_label(latest_last_prompt_session)
+            if latest_last_prompt_session is not None
+            else None
+        ),
+        "latest_last_prompt_leaf_uuid": (
+            _bounded_diagnostic_label(latest_last_prompt_leaf)
+            if latest_last_prompt_leaf is not None
+            else None
+        ),
         "active_chain_length": len(active_chain),
-        "active_chain_missing_uuid": active_chain_missing_uuid,
+        "active_chain_missing_uuid": (
+            _bounded_diagnostic_label(active_chain_missing_uuid)
+            if active_chain_missing_uuid is not None
+            else None
+        ),
         "active_chain_loop": active_chain_loop,
         "active_chain_min_line": min(active_chain_lines) if active_chain_lines else None,
         "active_chain_max_line": max(active_chain_lines) if active_chain_lines else None,
@@ -7273,6 +7627,10 @@ def validate_records(records: Sequence[JsonObj]) -> Dict[str, Any]:
         "type_counts": dict(type_counts.most_common()),
         "session_counts": dict(session_counts.most_common(20)),
     }
+    return _bounded_public_diagnostic_structure(
+        validation,
+        redactions=_long_diagnostic_strings(records),
+    )
 
 
 def validate_jsonl(path: pathlib.Path) -> Dict[str, Any]:
@@ -7284,8 +7642,8 @@ def validate_jsonl(path: pathlib.Path) -> Dict[str, Any]:
 
 
 def validate_jsonl_bytes(data: bytes, source_label: str = "JSONL") -> Dict[str, Any]:
-    records, _ = parse_jsonl_bytes(data, source_label=source_label)
-    result = validate_records(records)
+    records, _raw_lines, physical_lines = parse_jsonl_bytes_with_lines(data, source_label=source_label)
+    result = validate_records(records, physical_lines=physical_lines)
     result["path"] = pathlib.Path(source_label).name
     result["bytes"] = len(data)
     result["sha256"] = sha256_hex(data)

@@ -1653,6 +1653,68 @@ class TestActiveChain(CompressBase):
         self.assertNotIn("activeChainUuids", public)
         self.assertGreater(public["activeChainRecordCount"], 0)
 
+    def test_public_resume_projection_and_cli_bound_long_session_values(self):
+        session_marker = "SESSION_SECRET_" + "s" * 10000
+        tb = fx.build_linear(session_marker, turns=3)
+        internal = ccj.choose_resume_leaf_info(tb.records)
+        self.assertTrue(internal["ok"], internal["errors"])
+        self.assertEqual(internal["authoritySessionId"], session_marker)
+        public = ccj.public_resume_leaf_info(internal)
+        rendered = json.dumps(public, ensure_ascii=False)
+        self.assertNotIn("SESSION_SECRET_", rendered)
+        self.assertEqual(public["authoritySessionId"], ccj._bounded_diagnostic_label(session_marker))
+        self.assertEqual(public["currentSessionId"], ccj._bounded_diagnostic_label(session_marker))
+
+        src = fx.write_jsonl(self.tmp / "long-session.jsonl", tb.records)
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = ccj.main(["--input", str(src), "--analyze-resume-path"])
+        self.assertEqual(code, 0)
+        self.assertNotIn("SESSION_SECRET_", stdout.getvalue())
+        self.assertIn("sha256=", stdout.getvalue())
+
+        duplicate_marker = "UUID_SECRET_" + "u" * 10000
+        duplicate = fx.build_linear("dededede-dede-dede-dede-dededededede", turns=3)
+        duplicate.records[1]["uuid"] = duplicate_marker
+        duplicate.records[2]["uuid"] = duplicate_marker
+        duplicate_info = ccj.choose_resume_leaf_info(duplicate.records)
+        self.assertFalse(duplicate_info["ok"])
+        duplicate_public = ccj.public_resume_leaf_info(duplicate_info)
+        self.assertNotIn("UUID_SECRET_", json.dumps(duplicate_public, ensure_ascii=False))
+
+        duplicate_src = fx.write_jsonl(self.tmp / "long-duplicate.jsonl", duplicate.records)
+        duplicate_stdout = io.StringIO()
+        with contextlib.redirect_stdout(duplicate_stdout):
+            duplicate_code = ccj.main(["--input", str(duplicate_src), "--analyze-resume-path"])
+        self.assertEqual(duplicate_code, 2)
+        self.assertNotIn("UUID_SECRET_", duplicate_stdout.getvalue())
+
+        type_marker = "TYPE_SECRET_" + "t" * 10000
+        extension = fx.build_linear("dfdfdfdf-dfdf-dfdf-dfdf-dfdfdfdfdfdf", turns=3)
+        extension.add_raw(
+            {
+                "type": type_marker,
+                "uuid": "post-last-prompt",
+                "parentUuid": extension.records[-1]["leafUuid"],
+                "sessionId": extension.session_id,
+            }
+        )
+        extension_info = ccj.choose_resume_leaf_info(extension.records, max_post_prompt_extension=1)
+        self.assertFalse(extension_info["ok"])
+        self.assertNotIn("TYPE_SECRET_", json.dumps(ccj.public_resume_leaf_info(extension_info), ensure_ascii=False))
+
+        extension_src = fx.write_jsonl(self.tmp / "long-extension-type.jsonl", extension.records)
+        extension_stdout = io.StringIO()
+        with contextlib.redirect_stdout(extension_stdout):
+            extension_code = ccj.main(
+                [
+                    "--input", str(extension_src), "--analyze-resume-path",
+                    "--max-post-last-prompt-extension", "1",
+                ]
+            )
+        self.assertEqual(extension_code, 2)
+        self.assertNotIn("TYPE_SECRET_", extension_stdout.getvalue())
+
     def test_analyze_resume_path_cli_reports_reason_code_without_writes(self):
         tb = fx.build_linear("dcdcdcdc-dcdc-dcdc-dcdc-dcdcdcdcdcdc", turns=3)
         tb.records[-1]["leafUuid"] = 7
@@ -1720,6 +1782,47 @@ class TestToolPairing(CompressBase):
         v = ccj.validate_jsonl(src)
         self.assertFalse(v["ok"])
         self.assertGreater(v["tool_pair_error_count"], 0)
+
+    def test_split_tool_result_misordering_reports_later_fragment_physical_line(self):
+        tb = fx.TranscriptBuilder("e4e4e4e4-e4e4-e4e4-e4e4-e4e4e4e4e4e4")
+        tb.user("read two files")
+        tb.split_tool_result_pair()
+        tb.assistant_text("done")
+        tb.last_prompt()
+
+        result_indexes = [
+            index
+            for index, record in enumerate(tb.records)
+            if ccj.tool_result_ids(record)
+        ]
+        self.assertEqual(len(result_indexes), 2)
+        later_index = result_indexes[1]
+        later_content = tb.records[later_index]["message"]["content"]
+        tb.records[later_index]["message"]["content"] = [
+            {"type": "text", "text": "interleaved before the later result"},
+            later_content[0],
+        ]
+
+        encoded = [
+            json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            for record in tb.records
+        ]
+        physical = [b""]
+        expected_line = None
+        for index, line in enumerate(encoded):
+            if index == later_index:
+                physical.extend([b"", b""])
+                expected_line = len(physical) + 1
+            physical.append(line)
+        self.assertIsNotNone(expected_line)
+
+        result = ccj.validate_jsonl_bytes(b"\n".join(physical) + b"\n")
+        sample = next(
+            item
+            for item in result["tool_pair_error_samples"]
+            if item.get("reason") == "tool_result blocks are not first in user message content"
+        )
+        self.assertEqual(sample["line"], expected_line)
 
 
 class TestRepeatedCompression(CompressBase):
@@ -2325,6 +2428,77 @@ class TestEdgeCases(CompressBase):
         )
         self.assertTrue(report["validation"]["ok"], report["validation"]["errors"])
 
+    def test_source_active_chain_preflight_reports_original_physical_tool_line(self):
+        session_id = "15151515-1515-1515-1515-151515151515"
+        tb = fx.TranscriptBuilder(session_id)
+        for index in range(24):
+            tb.user(f"old user {index}")
+            tb.assistant_text(f"old assistant {index}")
+        tb.user("trigger a missing tool result")
+        tool_uuid = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+        tb._add(
+            tb._base(
+                "assistant",
+                uuid=tool_uuid,
+                timestamp="2026-06-01T10:00:00.000Z",
+                message={
+                    "id": "msg_missing_result",
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "toolu_missing_result", "name": "Read", "input": {}}],
+                },
+            )
+        )
+        tb.last_prompt()
+        tb.records.insert(
+            0,
+            {
+                "type": "assistant",
+                "uuid": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                "parentUuid": None,
+                "sessionId": session_id,
+                "message": {"role": "assistant", "content": "inactive branch"},
+            },
+        )
+        encoded = [json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode("utf-8") for record in tb.records]
+        physical: list[bytes] = []
+        expected_tool_line = None
+        for index, line in enumerate(encoded):
+            if index == 1:
+                physical.extend(["\u00a0".encode("utf-8"), b""])
+            if tb.records[index].get("uuid") == tool_uuid:
+                expected_tool_line = len(physical) + 1
+            physical.append(line)
+        self.assertIsNotNone(expected_tool_line)
+        source = b"\xef\xbb\xbf" + b"\r\n".join(physical) + b"\r\n"
+        src = self.tmp / "physical-preflight.jsonl"
+        out = self.tmp / "physical-preflight-out.jsonl"
+        src.write_bytes(source)
+
+        public_validation = ccj.validate_jsonl_bytes(source)
+        public_sample = next(
+            item
+            for item in public_validation["tool_pair_error_samples"]
+            if item.get("reason") == "assistant tool_use is final api message"
+        )
+        self.assertEqual(public_sample["line"], expected_tool_line)
+        with self.assertRaisesRegex(ValueError, rf"'line': {expected_tool_line}"):
+            ccj.build_model_summary_pack_for_input(
+                input_path=src,
+                target_ratio=0.3,
+                min_recent_records=8,
+                summary_char_budget=4000,
+            )
+        with self.assertRaisesRegex(ValueError, rf"'line': {expected_tool_line}"):
+            ccj.compress_jsonl(
+                input_path=src,
+                output_path=out,
+                target_ratio=0.3,
+                min_recent_records=8,
+                summary_char_budget=4000,
+                deterministic_summary=True,
+            )
+        self.assertFalse(out.exists())
+
     def test_records_without_uuid(self):
         records = [{"type": "user", "message": {"role": "user", "content": f"hello {i} 必须保留"}} for i in range(30)]
         report, _out = self.compress(
@@ -2332,6 +2506,23 @@ class TestEdgeCases(CompressBase):
             preserve_active_chain=False,
         )
         self.assertTrue(report["validation"]["ok"], report["validation"]["errors"])
+
+    def test_compression_handles_unhashable_type_and_session_id_values(self):
+        for index, (field, value) in enumerate((("type", []), ("sessionId", {"nested": True}))):
+            tb = fx.build_linear(
+                "16161616-1616-1616-1616-161616161616",
+                turns=140,
+            )
+            tb.records[10][field] = value
+            report, out = self.compress(
+                tb.records,
+                out_name=f"unhashable-{index}.jsonl",
+                summary_char_budget=6000,
+                min_recent_records=8,
+                target_ratio=0.3,
+            )
+            self.assertTrue(report["validation"]["ok"], report["validation"]["errors"])
+            self.assertTrue(out.exists())
 
     def test_cjk_preserved_in_summary(self):
         tb = fx.build_linear("11111111-1111-1111-1111-111111111111", turns=40)
@@ -2363,6 +2554,221 @@ class TestValidator(CompressBase):
         self.assertFalse(result["ok"])
         self.assertGreater(result["malformed_parent_count"], 0)
         self.assertEqual(result["malformed_parent_samples"][0]["parentUuidType"], "dict")
+
+    def test_validation_ignores_untrusted_internal_line_fields(self):
+        tb = fx.build_linear(
+            "12121212-1212-1212-1212-121212121212",
+            turns=12,
+            with_tools_every=2,
+        )
+        expected_info = ccj.choose_resume_leaf_info(tb.records)
+        expected_lines = [
+            index + 1
+            for index in expected_info["activeChainIndexes"]
+            if ccj.is_api_message(tb.records[index])
+        ]
+        for hostile_line in ("not-an-int", [], {}, 7.5):
+            for record in tb.records:
+                record["_line"] = hostile_line
+                record["_mergedLines"] = {"hostile": "value"}
+                record["_mergedUuids"] = 42
+                record["_validationContentLines"] = [999999]
+            pairs = ccj.active_api_messages_for_validation(tb.records)
+            self.assertEqual([line for line, _obj in pairs], expected_lines)
+            self.assertTrue(all(isinstance(line, int) for line, _obj in pairs))
+
+    def test_validator_handles_unhashable_type_and_session_id_values(self):
+        for field, value, label in (
+            ("type", [], "<invalid:list>"),
+            ("type", {"nested": True}, "<invalid:dict>"),
+            ("sessionId", [], "<invalid:list>"),
+            ("sessionId", {"nested": True}, "<invalid:dict>"),
+        ):
+            tb = fx.build_linear(
+                "13131313-1313-1313-1313-131313131313",
+                turns=12,
+            )
+            tb.records[1][field] = value
+            result = ccj.validate_records(tb.records)
+            self.assertIsInstance(result, dict)
+            if field == "type":
+                self.assertIn(label, result["type_counts"])
+            else:
+                self.assertIn(label, result["session_counts"])
+
+    def test_diagnostic_counter_labels_do_not_collide_or_expose_complex_values(self):
+        records = [
+            {"type": "<invalid:list>", "sessionId": "<null>"},
+            {"type": [], "sessionId": None},
+        ]
+        result = ccj.validate_records(records)
+        self.assertEqual(result["type_counts"]["<<invalid:list>"], 1)
+        self.assertEqual(result["type_counts"]["<invalid:list>"], 1)
+        self.assertEqual(result["session_counts"]["<<null>"], 1)
+        self.assertEqual(result["session_counts"]["<null>"], 1)
+
+        info = ccj.collect_summary_inputs(
+            [{"type": {"secret": "TYPE_SECRET"}, "subtype": {"secret": "SUBTYPE_SECRET"}}]
+        )
+        subtype_counts = dict(info["subtype_counts"])
+        self.assertEqual(subtype_counts, {"<invalid:dict>:<invalid:dict>": 1})
+        self.assertNotIn("SECRET", json.dumps(subtype_counts, ensure_ascii=False))
+
+    def test_diagnostics_and_system_evidence_bound_untrusted_metadata(self):
+        type_marker = "TYPE_SECRET_" + "x" * 10000
+        session_marker = "SESSION_SECRET_" + "y" * 10000
+        subtype_marker = "SUBTYPE_SECRET_" + "z" * 4000
+        uuid_marker = "UUID_SECRET_" + "u" * 10000
+        tb = fx.build_linear("14141414-1414-1414-1414-141414141414", turns=12)
+        tb.records[1]["type"] = type_marker
+        tb.records[1]["parentUuid"] = {"malformed": True}
+        tb.records[-1]["leafUuid"] = uuid_marker
+        tb.records[-1]["sessionId"] = session_marker
+        result = ccj.validate_records(tb.records)
+        rendered = json.dumps(result, ensure_ascii=False)
+        self.assertNotIn(type_marker, rendered)
+        self.assertNotIn(session_marker, rendered)
+        self.assertNotIn(uuid_marker, rendered)
+        self.assertNotIn("TYPE_SECRET_", rendered)
+        self.assertNotIn("SESSION_SECRET_", rendered)
+        self.assertNotIn("UUID_SECRET_", rendered)
+        self.assertLess(len(rendered), 20000)
+        self.assertTrue(
+            any("latest last-prompt active chain has missing uuid" in error for error in result["errors"])
+        )
+        self.assertTrue(result["malformed_parent_samples"][0]["type"].startswith("<string:"))
+        self.assertTrue(result["last_prompt_missing_leaf_samples"][0]["sessionId"].startswith("<string:"))
+        self.assertTrue(result["latest_last_prompt_session_id"].startswith("<string:"))
+        self.assertTrue(result["latest_last_prompt_leaf_uuid"].startswith("<string:length="))
+
+        system_error = {
+            "type": "system",
+            "subtype": {"marker": subtype_marker},
+            "error": True,
+        }
+        summary_inputs = ccj.collect_summary_inputs([system_error])
+        evidence = ccj.model_evidence_record(system_error, 1)
+        self.assertNotIn(subtype_marker, json.dumps(summary_inputs, ensure_ascii=False))
+        self.assertNotIn(subtype_marker, json.dumps(evidence, ensure_ascii=False))
+        self.assertIn("<invalid:dict>", summary_inputs["errors"][0][1])
+
+    def test_parent_repair_details_bound_arbitrary_metadata(self):
+        type_marker = "TYPE_SECRET_" + "x" * 10000
+        session_marker = "SESSION_SECRET_" + "y" * 10000
+        repair = {
+            "uuid": "UUID_SECRET_" + "u" * 10000,
+            "type": type_marker,
+            "sessionId": session_marker,
+            "oldParentUuid": "OLD_SECRET_" + "o" * 10000,
+            "newParentUuid": "NEW_SECRET_" + "n" * 10000,
+            "reason": "compression_cut_spliced_to_compact_summary",
+        }
+        public = ccj.public_parent_repair_details([repair])
+        rendered = json.dumps(public, ensure_ascii=False)
+        for marker in ("UUID_SECRET_", "TYPE_SECRET_", "SESSION_SECRET_", "OLD_SECRET_", "NEW_SECRET_"):
+            self.assertNotIn(marker, rendered)
+        self.assertEqual(public[0]["reason"], repair["reason"])
+        self.assertTrue(public[0]["sessionId"].startswith("<string:length="))
+
+    def test_jsonl_validation_reports_physical_lines_across_blanks_and_inactive_branches(self):
+        records = [
+            {
+                "type": "assistant",
+                "uuid": "13131313-1313-1313-1313-131313131313",
+                "parentUuid": None,
+                "sessionId": "13131313-1313-1313-1313-131313131313",
+                "message": {"role": "assistant", "content": "inactive branch"},
+            },
+            {
+                "type": "user",
+                "uuid": "14141414-1414-1414-1414-141414141414",
+                "parentUuid": None,
+                "sessionId": "14141414-1414-1414-1414-141414141414",
+                "message": {"role": "user", "content": "hello"},
+            },
+            {
+                "type": "assistant",
+                "uuid": "15151515-1515-1515-1515-151515151515",
+                "parentUuid": "14141414-1414-1414-1414-141414141414",
+                "sessionId": "14141414-1414-1414-1414-141414141414",
+                "_line": {"must": "ignore"},
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "toolu_physical", "name": "Read", "input": {}}],
+                },
+            },
+            {
+                "type": "last-prompt",
+                "leafUuid": "15151515-1515-1515-1515-151515151515",
+                "sessionId": "14141414-1414-1414-1414-141414141414",
+            },
+        ]
+        logical = [json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode("utf-8") for record in records]
+        source = b"\n" + logical[0] + b"\n\n" + b"\n".join(logical[1:]) + b"\n"
+        parsed, raw_lines, physical_lines = ccj.parse_jsonl_bytes_with_lines(source)
+        self.assertEqual(len(parsed), len(raw_lines))
+        self.assertEqual(physical_lines, [2, 4, 5, 6])
+        result = ccj.validate_jsonl_bytes(source)
+        self.assertEqual(result["latest_last_prompt_line"], 6)
+        self.assertEqual(result["active_chain_min_line"], 4)
+        self.assertEqual(result["active_chain_max_line"], 5)
+        self.assertEqual(result["tool_pair_error_samples"][0]["line"], 5)
+
+    def test_fragmented_tool_blocks_keep_their_own_physical_lines(self):
+        session_id = "17171717-1717-1717-1717-171717171717"
+        records = [
+            {
+                "type": "assistant",
+                "uuid": "18181818-1818-1818-1818-181818181818",
+                "parentUuid": None,
+                "sessionId": session_id,
+                "message": {"role": "assistant", "content": "inactive branch"},
+            },
+            {
+                "type": "user",
+                "uuid": "19191919-1919-1919-1919-191919191919",
+                "parentUuid": None,
+                "sessionId": session_id,
+                "message": {"role": "user", "content": "start"},
+            },
+            {
+                "type": "assistant",
+                "uuid": "20202020-2020-2020-2020-202020202020",
+                "parentUuid": "19191919-1919-1919-1919-191919191919",
+                "sessionId": session_id,
+                "message": {"id": "msg_fragmented", "role": "assistant", "content": [{"type": "text", "text": "first"}]},
+            },
+            {
+                "type": "assistant",
+                "uuid": "21212121-2121-2121-2121-212121212121",
+                "parentUuid": "20202020-2020-2020-2020-202020202020",
+                "sessionId": session_id,
+                "_line": "hostile",
+                "message": {
+                    "id": "msg_fragmented",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": [], "name": "Read", "input": {}},
+                        {"type": "tool_use", "id": "toolu_late_fragment", "name": "Read", "input": {}},
+                    ],
+                },
+            },
+            {
+                "type": "last-prompt",
+                "leafUuid": "21212121-2121-2121-2121-212121212121",
+                "sessionId": session_id,
+            },
+        ]
+        encoded = [json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode("utf-8") for record in records]
+        physical = [b"", encoded[0], b"", encoded[1], encoded[2], b"", b"", encoded[3], encoded[4]]
+        result = ccj.validate_jsonl_bytes(b"\n".join(physical) + b"\n")
+        self.assertEqual(result["malformed_tool_id_samples"][0]["line"], 8)
+        final_use = next(
+            item
+            for item in result["tool_pair_error_samples"]
+            if item.get("reason") == "assistant tool_use is final api message"
+        )
+        self.assertEqual(final_use["line"], 8)
 
     def test_validator_accepts_one_way_session_lineage_as_compatibility(self):
         old_session = "17171717-1717-1717-1717-171717171717"

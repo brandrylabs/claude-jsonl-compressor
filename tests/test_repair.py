@@ -195,6 +195,36 @@ class TestReadPagesPlanning(RepairBase):
         output = rcj.apply_patch_plan(source, plan)
         self.assertTrue(rcj.validate_repair(source, output, plan)["ok"])
 
+    def test_repair_report_uses_physical_record_lines_after_blank_records(self):
+        _tb, source = self.build_source(["1"])
+        logical = source.splitlines()
+        source_with_blanks = b"\n" + logical[0] + b"\n\n" + b"\n".join(logical[1:]) + b"\n"
+        plan = rcj.plan_read_pages_repairs(source_with_blanks)
+        self.assertEqual(plan["matches"][0]["recordLine"], 4)
+        self.assertEqual(plan["patches"][0]["recordLine"], 4)
+        output = rcj.apply_patch_plan(source_with_blanks, plan)
+        self.assertTrue(rcj.validate_repair(source_with_blanks, output, plan)["ok"])
+
+    def test_bom_crlf_repair_report_uses_physical_record_lines(self):
+        _tb, source = self.build_source(["1"], bom=True, crlf=True)
+        plan = rcj.plan_read_pages_repairs(source)
+        self.assertEqual(plan["matches"][0]["recordLine"], 2)
+        self.assertEqual(plan["patches"][0]["recordLine"], 2)
+        output = rcj.apply_patch_plan(source, plan)
+        self.assertTrue(rcj.validate_repair(source, output, plan)["ok"])
+
+    def test_unicode_only_blank_lines_match_the_jsonl_parser(self):
+        _tb, source = self.build_source(["1"])
+        for whitespace in ("\u00a0", "\u3000"):
+            with self.subTest(whitespace=ord(whitespace)):
+                source_with_blank = whitespace.encode("utf-8") + b"\n" + source
+                _records, _raw_lines, physical_lines = ccj.parse_jsonl_bytes_with_lines(source_with_blank)
+                self.assertEqual(physical_lines[0], 2)
+                plan = rcj.plan_read_pages_repairs(source_with_blank)
+                self.assertEqual(plan["matches"][0]["recordLine"], 3)
+                output = rcj.apply_patch_plan(source_with_blank, plan)
+                self.assertTrue(rcj.validate_repair(source_with_blank, output, plan)["ok"])
+
     def test_duplicate_keys_anywhere_in_physical_file_block_repair(self):
         _tb, source = self.build_source(["1"])
         source += b'{"type":"custom-title","title":"first","title":"second"}\n'

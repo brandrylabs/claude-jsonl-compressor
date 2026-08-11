@@ -172,9 +172,10 @@ def member_deletion_span(object_node: Node, target: Member) -> Tuple[int, int]:
     return object_node.members[index - 1].end, target.end
 
 
-def jsonl_record_spans(data: bytes) -> List[Tuple[int, int, bytes]]:
-    spans: List[Tuple[int, int, bytes]] = []
+def _jsonl_record_spans_with_lines(data: bytes) -> List[Tuple[int, int, int, bytes]]:
+    spans: List[Tuple[int, int, int, bytes]] = []
     offset = 0
+    physical_line = 1
     while offset < len(data):
         lf_index = data.find(b"\n", offset)
         physical_end = len(data) if lf_index < 0 else lf_index
@@ -183,12 +184,17 @@ def jsonl_record_spans(data: bytes) -> List[Tuple[int, int, bytes]]:
         if start == 0 and data.startswith(b"\xef\xbb\xbf"):
             start = 3
         content = data[start:content_end]
-        if content.strip():
-            spans.append((start, content_end, content))
+        if content.decode("utf-8", errors="strict").strip():
+            spans.append((physical_line, start, content_end, content))
         if lf_index < 0:
             break
         offset = lf_index + 1
+        physical_line += 1
     return spans
+
+
+def jsonl_record_spans(data: bytes) -> List[Tuple[int, int, bytes]]:
+    return [(start, end, content) for _line, start, end, content in _jsonl_record_spans_with_lines(data)]
 
 
 def _node_at_tool_input(root: Node, block_index: int) -> Tuple[Node, Member]:
@@ -215,12 +221,17 @@ def plan_read_pages_repairs(
     scope: str = "active-chain",
     resume_leaf_override: Optional[str] = None,
 ) -> Dict[str, Any]:
-    records, _raw_lines = ccj.parse_jsonl_bytes(source_bytes, source_label="SOURCE_JSONL")
-    line_spans = jsonl_record_spans(source_bytes)
+    records, _raw_lines, physical_lines = ccj.parse_jsonl_bytes_with_lines(
+        source_bytes,
+        source_label="SOURCE_JSONL",
+    )
+    line_spans = _jsonl_record_spans_with_lines(source_bytes)
     if len(line_spans) != len(records):
         raise ValueError("record/span count mismatch while planning byte repair")
+    if [line for line, _start, _end, _bytes in line_spans] != physical_lines:
+        raise ValueError("record/span physical line map mismatch while planning byte repair")
     parsed_roots: List[Node] = []
-    for _line_start, _line_end, line_bytes in line_spans:
+    for _physical_line, _line_start, _line_end, line_bytes in line_spans:
         root = SpanJsonParser(line_bytes).parse()
         assert_no_duplicate_keys(root)
         parsed_roots.append(root)
@@ -251,7 +262,7 @@ def plan_read_pages_repairs(
         content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, list):
             continue
-        line_start, _line_end, line_bytes = line_spans[record_index]
+        physical_line, line_start, _line_end, line_bytes = line_spans[record_index]
         root_node = parsed_roots[record_index]
         for block_index, block in enumerate(content):
             if not isinstance(block, dict) or block.get("type") != "tool_use" or block.get("name") != "Read":
@@ -301,7 +312,7 @@ def plan_read_pages_repairs(
             else:
                 reason = "missing-file-path"
             match = {
-                "recordLine": record_index + 1,
+                "recordLine": physical_line,
                 "blockIndex": block_index,
                 "toolUseId": tool_id,
                 "pairedToolResult": paired,
@@ -322,7 +333,7 @@ def plan_read_pages_repairs(
                 {
                     "start": line_start + rel_start,
                     "end": line_start + rel_end,
-                    "recordLine": record_index + 1,
+                    "recordLine": physical_line,
                     "blockIndex": block_index,
                     "toolUseId": tool_id,
                 }

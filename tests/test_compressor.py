@@ -22,6 +22,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import pathlib
 import random
 import re
@@ -44,6 +45,13 @@ class CompressBase(unittest.TestCase):
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
+
+    @staticmethod
+    def replacement_stat(identity: os.stat_result) -> os.stat_result:
+        """Return an observable replacement identity without relying on inode reuse."""
+        fields = list(identity)
+        fields[1] = identity.st_ino + 1
+        return os.stat_result(fields)
 
     def compress(self, src_records, out_name="out.jsonl", **kwargs):
         src = fx.write_jsonl(self.tmp / "src.jsonl", src_records)
@@ -2973,6 +2981,7 @@ class TestTransactionalWrites(CompressBase):
                 marker = path.read_bytes()
                 real_unlink(path)
                 path.write_bytes(marker)
+                return self.replacement_stat(real_lstat(path))
             return real_lstat(path)
 
         try:
@@ -3218,6 +3227,7 @@ class TestTransactionalWrites(CompressBase):
                     captured_bytes = path.read_bytes()
                     real_unlink(path)
                     path.write_bytes(captured_bytes)
+                    return self.replacement_stat(real_lstat(path))
             return real_lstat(path)
 
         try:

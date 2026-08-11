@@ -100,8 +100,17 @@ Keep recent raw records for rewind, use the default model-assisted summary, and 
 - Python 3.10 或更新版本
 - 仅在使用 npm 命令包装器时需要 Node.js 22 或更新版本
 - Claude Code 为可选项；仅在显式要求进行运行时 `/resume` 或 `/context` 冒烟测试时才需要
+- 目标文件所在卷需支持硬链接，仅 `--replace-original` 需要
 
 无需安装任何 Python 包。
+
+### 原地替换对硬链接的要求
+
+`--replace-original` 使用 `os.link` 发布候选文件，以确保绝不覆盖并发占用者；回滚路径同样以该方式恢复此前捕获的原始文件。因此两者都要求会话文件所在卷支持硬链接。
+
+压缩器会在暂存、备份或移动任何文件之前进行探测。若文件系统拒绝 `os.link`，运行会停止，此时目标文件仍在原位，且未写入任何内容。通常无法满足该要求的文件系统包括 FAT32/exFAT 移动介质、部分 SMB/NFS 挂载以及部分容器绑定挂载。NTFS 与 ext4 没有问题。
+
+候选文件输出不受影响：它通过 `os.replace` 发布，不依赖硬链接。
 
 ## 安装
 

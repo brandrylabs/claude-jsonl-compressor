@@ -1,14 +1,10 @@
-<p align="center">
-  <a href="../README.md"><img alt="English" src="https://img.shields.io/badge/English-6b7280?style=for-the-badge"></a>
-  <a href="README.zh-CN.md"><img alt="简体中文" src="https://img.shields.io/badge/%E7%AE%80%E4%BD%93%E4%B8%AD%E6%96%87-2563eb?style=for-the-badge"></a>
-  <a href="README.ja.md"><img alt="日本語" src="https://img.shields.io/badge/%E6%97%A5%E6%9C%AC%E8%AA%9E-6b7280?style=for-the-badge"></a>
-</p>
-
 # Claude JSONL Compressor
+
+[English](../README.md) | [简体中文](README.zh-CN.md) | [日本語](README.ja.md)
 
 针对单个 Claude Code 会话记录的严格的模型辅助压缩，另外提供一个独立的、保持字节不变的兼容性修复，用于处理历史 `Read.pages` 记录。
 
-**版本：** [`1.0.0-rc.1`](../CHANGELOG.md)<br>
+**版本：** [`1.0.0`](../CHANGELOG.md)<br>
 **引擎：** `v10`<br>
 **模型包 schema：** `v11`<br>
 **许可证：** GPL-3.0-only<br>
@@ -153,10 +149,10 @@ Remove-Item -LiteralPath $skill -Recurse -Force
 
 ### 安装 npm CLI
 
-在 RC 发布之后：
+在 1.0.0 正式版发布之后：
 
 ```bash
-npm install --global @brandry/claude-jsonl-compressor@rc
+npm install --global @brandry/claude-jsonl-compressor
 ```
 
 这会安装两个命令：
@@ -171,7 +167,7 @@ claude-jsonl-repair-read-pages
 升级或卸载全局 CLI：
 
 ```bash
-npm install --global @brandry/claude-jsonl-compressor@rc
+npm install --global @brandry/claude-jsonl-compressor
 npm update --global @brandry/claude-jsonl-compressor
 npm uninstall --global @brandry/claude-jsonl-compressor
 ```
@@ -179,7 +175,7 @@ npm uninstall --global @brandry/claude-jsonl-compressor
 本地开发安装与调用：
 
 ```bash
-npm install --save-dev @brandry/claude-jsonl-compressor@rc
+npm install --save-dev @brandry/claude-jsonl-compressor
 npm update @brandry/claude-jsonl-compressor
 npm exec -- claude-jsonl-compressor --version
 npm exec -- claude-jsonl-repair-read-pages --version
@@ -189,15 +185,15 @@ npm uninstall @brandry/claude-jsonl-compressor
 在不保留安装的情况下运行：
 
 ```bash
-npx --yes --package @brandry/claude-jsonl-compressor@rc claude-jsonl-compressor --version
-npx --yes --package @brandry/claude-jsonl-compressor@rc claude-jsonl-repair-read-pages --version
+npx --yes --package @brandry/claude-jsonl-compressor claude-jsonl-compressor --version
+npx --yes --package @brandry/claude-jsonl-compressor claude-jsonl-repair-read-pages --version
 ```
 
 实际的 npm/npx 操作使用相同的 Python CLI 选项：
 
 ```bash
-npx --yes --package @brandry/claude-jsonl-compressor@rc claude-jsonl-compressor --input session.jsonl --write-model-pack run/session.model-pack.md
-npx --yes --package @brandry/claude-jsonl-compressor@rc claude-jsonl-repair-read-pages --input session.jsonl --scan-only
+npx --yes --package @brandry/claude-jsonl-compressor claude-jsonl-compressor --input session.jsonl --write-model-pack run/session.model-pack.md
+npx --yes --package @brandry/claude-jsonl-compressor claude-jsonl-repair-read-pages --input session.jsonl --scan-only
 ```
 
 ### 不安装、直接从源码使用
@@ -562,24 +558,24 @@ python -B -I -S scripts/compress_claude_jsonl.py --version
 python -B -I -S scripts/repair_claude_jsonl.py --version
 npm test
 npm pack --dry-run --json
-npm publish --dry-run --access public --tag rc
+npm publish --dry-run --access public --tag latest
 ```
 
 发布测试套件覆盖活动/失效分支划分、固定随机种子的拓扑变换、严格指针失败、双重模型包预算、完整结构化 token 计量、多语言语义账目与 thinking、交接内容、请求/论断摘要值、必需的支撑摘录、工具配对、重复压缩、检查点策略、事务竞态与已提交报告状态、精确字节修复、BOM/CRLF、npm 压缩包白名单以及离线压缩包安装。
 
-### 维护者 RC 发布清单
+### 维护者正式版发布清单
 
-1. 确认公共代码树干净，并且 `package.json`、Python 版本输出、文档和测试中的 `1.0.0-rc.1` 取值一致。
+1. 确认公共代码树干净，并且 `package.json`、Python 版本输出、文档和测试中的 `1.0.0` 取值一致。
 2. 运行上面的 Python、npm、隔离 Python、压缩包、隐私与离线安装各项关卡。
 3. 检查 `npm pack --dry-run --json`；只发布白名单内的文件。
-4. 要求工作区干净，创建带注释的标签 `v1.0.0-rc.1`，并推送该提交与标签。
-5. 对于第一次手动 RC，请在已认证并启用 npm 双因素认证的维护者机器上发布：
+4. 要求工作区干净，创建带注释的标签 `v1.0.0`，并推送该提交与标签。
+5. 在具有此包发布权限的已认证维护者环境中发布：
 
 ```bash
-npm publish --access public --tag rc
+npm publish --access public --tag latest
 ```
 
-6. 核实 npm 版本与 `rc` dist-tag，然后基于已推送的标签创建 GitHub 预发布。
+6. 核实 npm 版本 `1.0.0` 与 `latest` dist-tag，然后基于已推送的标签创建正式 GitHub Release（不要勾选 prerelease）。
 
 不要在本地发布命令后追加 `--provenance`。npm provenance 需要受支持的云端 CI runner。对于后续版本，更推荐从一个公开 GitHub 仓库、在 GitHub 托管的 runner 上使用 npm trusted publishing，并配合 `id-token: write`、受保护的发布标签以及匹配的受保护环境；trusted publishing 会自动生成 provenance。
 

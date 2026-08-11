@@ -119,4 +119,4 @@ jobs:
       # observable; it keeps that a property of the workflow rather than an
       # accident of the current manifest.
       - name: Publish dry run
-        run: npm publish --dry-run --access public --tag rc --ignore-scripts
+        run: npm publish --dry-run --access public --tag latest --ignore-scripts

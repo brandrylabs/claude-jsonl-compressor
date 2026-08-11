@@ -34,6 +34,16 @@ PUBLIC_DIR_SUFFIXES = {
 IGNORED_REPOSITORY_PARTS = {".git"}
 GENERATED_PARTS = {"__pycache__", ".pytest_cache", ".npm", "node_modules"}
 GENERATED_SUFFIXES = {".pyc", ".pyo", ".tgz"}
+REPOSITORY_BLOB_URL = "https://github.com/brandrylabs/claude-jsonl-compressor/blob"
+
+
+def root_language_navigation(version: str) -> str:
+    base = f"{REPOSITORY_BLOB_URL}/v{version}"
+    return (
+        f"[English]({base}/README.md) | "
+        f"[简体中文]({base}/docs/README.zh-CN.md) | "
+        f"[日本語]({base}/docs/README.ja.md)"
+    )
 
 
 def run(*args: str, cwd: pathlib.Path = ROOT) -> subprocess.CompletedProcess:
@@ -144,7 +154,7 @@ class TestNpmPackage(unittest.TestCase):
         for command in (
             "npm test --ignore-scripts",
             "npm pack --dry-run --json --ignore-scripts",
-            "npm publish --dry-run --access public --tag rc --ignore-scripts",
+            "npm publish --dry-run --access public --tag latest --ignore-scripts",
         ):
             self.assertIn(command, workflow)
         self.assertIn("permissions:\n  contents: read", workflow)
@@ -160,7 +170,8 @@ class TestNpmPackage(unittest.TestCase):
     def test_manifest_has_no_runtime_dependencies_or_install_hooks(self):
         manifest = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["name"], "@brandry/claude-jsonl-compressor")
-        self.assertEqual(manifest["version"], "1.0.0-rc.1")
+        self.assertEqual(manifest["version"], "1.0.0")
+        self.assertEqual(manifest["publishConfig"]["tag"], "latest")
         self.assertEqual(manifest["license"], "GPL-3.0-only")
         self.assertEqual(manifest["engines"]["node"], ">=22")
         self.assertEqual(
@@ -177,7 +188,31 @@ class TestNpmPackage(unittest.TestCase):
         )
         self.assertIn("CHANGELOG.md", manifest["files"])
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertIn("## [1.0.0] - 2026-08-11", changelog)
         self.assertIn("## [1.0.0-rc.1] - 2026-07-28", changelog)
+        for relative in (
+            "README.md",
+            "docs/README.zh-CN.md",
+            "docs/README.ja.md",
+            "SKILL.md",
+            "references/claude-jsonl-compression-format.md",
+        ):
+            self.assertIn(manifest["version"], (ROOT / relative).read_text(encoding="utf-8"), relative)
+        for relative in (
+            "README.md",
+            "docs/README.zh-CN.md",
+            "docs/README.ja.md",
+            "SKILL.md",
+            "references/claude-jsonl-compression-format.md",
+            "package.json",
+            "scripts/compress_claude_jsonl.py",
+            ".github/workflows/ci.yml",
+        ):
+            self.assertNotIn("1.0.0-rc.1", (ROOT / relative).read_text(encoding="utf-8"), relative)
+        format_notes = (ROOT / "references" / "claude-jsonl-compression-format.md").read_text(encoding="utf-8")
+        quote = chr(96)
+        self.assertIn("package {}{}{}".format(quote, manifest["version"], quote), format_notes)
+        self.assertIn("| Package | {}{}{} |".format(quote, manifest["version"], quote), format_notes)
         self.assertEqual(
             manifest["repository"]["url"],
             "git+https://github.com/brandrylabs/claude-jsonl-compressor.git",
@@ -229,13 +264,26 @@ class TestNpmPackage(unittest.TestCase):
 
     def test_release_guidance_separates_local_publish_from_ci_provenance(self):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn("npm publish --access public --tag rc", readme)
-        self.assertIn("npm publish --dry-run --access public --tag rc", readme)
-        self.assertNotIn("npm publish --access public --tag rc --provenance", readme)
+        self.assertIn("npm publish --access public --tag latest", readme)
+        self.assertIn("npm publish --dry-run --access public --tag latest", readme)
+        self.assertNotIn("npm publish --access public --tag latest --provenance", readme)
         self.assertIn("supported cloud CI", readme)
         self.assertIn("id-token: write", readme)
         self.assertIn("$env:CODEX_HOME", readme)
         self.assertIn("New-Item -ItemType Directory -Force", readme)
+
+    def test_readmes_use_plain_language_links_directly_below_the_title(self):
+        version = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))["version"]
+        expected_navigation = {
+            "README.md": root_language_navigation(version),
+            "docs/README.zh-CN.md": "[English](../README.md) | [简体中文](README.zh-CN.md) | [日本語](README.ja.md)",
+            "docs/README.ja.md": "[English](../README.md) | [简体中文](README.zh-CN.md) | [日本語](README.ja.md)",
+        }
+        for relative, navigation in expected_navigation.items():
+            text = (ROOT / relative).read_text(encoding="utf-8")
+            self.assertTrue(text.startswith(f"# Claude JSONL Compressor\n\n{navigation}\n\n"), relative)
+            self.assertNotIn("img.shields.io/badge", text, relative)
+            self.assertNotIn('<p align="center">', text, relative)
 
     def test_agent_prompt_is_concise_and_defers_detail_to_the_skill(self):
         metadata = (ROOT / "agents" / "openai.yaml").read_text(encoding="utf-8")
@@ -283,7 +331,7 @@ class TestNpmPackage(unittest.TestCase):
         self.assertEqual(json.loads(node_version.stdout), json.loads(python_version.stdout))
         self.assertEqual(json.loads(python_version.stdout)["defaultModelPackEstimatedTokenBudget"], 150000)
         repair_data = json.loads(repair_version.stdout)
-        self.assertEqual(repair_data["packageVersion"], "1.0.0-rc.1")
+        self.assertEqual(repair_data["packageVersion"], "1.0.0")
         self.assertEqual(repair_data["engineVersion"], "v10")
         self.assertEqual(repair_data["reportSchemaVersion"], 1)
 
@@ -292,7 +340,7 @@ class TestNpmPackage(unittest.TestCase):
             result = run(sys.executable, "-B", "-I", "-S", str(ROOT / "scripts" / script), "--version")
             self.assertEqual(result.returncode, 0, result.stderr)
             data = json.loads(result.stdout)
-            self.assertEqual(data["packageVersion"], "1.0.0-rc.1")
+            self.assertEqual(data["packageVersion"], "1.0.0")
             self.assertEqual(data["engineVersion"], "v10")
 
     def test_real_npm_tarball_matches_public_allowlist_and_installs_offline(self):
@@ -330,6 +378,9 @@ class TestNpmPackage(unittest.TestCase):
                     file_obj = archive.extractfile(member)
                     content = file_obj.read() if file_obj else b""
                     self.assert_private_markers_absent(member.name, content)
+                readme_file = archive.extractfile("package/README.md")
+                readme_text = (readme_file.read() if readme_file else b"").decode("utf-8")
+                self.assertIn(root_language_navigation(metadata[0]["version"]), readme_text)
                 self.assertTrue(
                     {
                         "package/SKILL.md",
@@ -358,7 +409,7 @@ class TestNpmPackage(unittest.TestCase):
                 else:
                     invoked = run(str(executable), "--version", cwd=tmp)
                 self.assertEqual(invoked.returncode, 0, invoked.stderr)
-                self.assertEqual(json.loads(invoked.stdout)["packageVersion"], "1.0.0-rc.1")
+                self.assertEqual(json.loads(invoked.stdout)["packageVersion"], "1.0.0")
 
 
 if __name__ == "__main__":

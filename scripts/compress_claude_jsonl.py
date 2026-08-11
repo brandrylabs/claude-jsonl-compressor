@@ -1987,6 +1987,49 @@ def numbered_backup_path(path: pathlib.Path, backup_dir: Optional[pathlib.Path] 
     raise RuntimeError(f"could not find free backup name for {path}")
 
 
+def _filesystem_error_detail(error: Exception) -> str:
+    detail = f"{type(error).__name__}: {error}"
+    errno_value = getattr(error, "errno", None)
+    winerror_value = getattr(error, "winerror", None)
+    if errno_value is not None:
+        detail += f"; errno={errno_value}"
+    if winerror_value is not None:
+        detail += f"; winerror={winerror_value}"
+    return detail
+
+
+def _cleanup_owned_file(
+    path: pathlib.Path,
+    *,
+    identity: Optional[os.stat_result],
+    expected_bytes: Optional[bytes],
+    owner_label: str,
+    missing_is_error: bool = False,
+) -> Optional[str]:
+    """Remove a unique temporary path only while its observed identity remains ours."""
+    if identity is None:
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            return f"{path.name}: {_filesystem_error_detail(exc)}"
+        return f"{path.name}: {owner_label} identity was not captured"
+    try:
+        if not os.path.samestat(identity, path.lstat()):
+            return f"{path.name}: {owner_label} identity changed before cleanup"
+        if expected_bytes is not None and path.read_bytes() != expected_bytes:
+            return f"{path.name}: {owner_label} bytes changed before cleanup"
+        if not os.path.samestat(identity, path.lstat()):
+            return f"{path.name}: {owner_label} identity changed before cleanup"
+        path.unlink()
+    except FileNotFoundError:
+        return f"{path.name}: disappeared before cleanup" if missing_is_error else None
+    except OSError as exc:
+        return f"{path.name}: {_filesystem_error_detail(exc)}"
+    return None
+
+
 def _exclusive_backup_from_bytes(
     path: pathlib.Path,
     source_bytes: bytes,
@@ -2001,26 +2044,42 @@ def _exclusive_backup_from_bytes(
     for backup in candidates:
         backup.parent.mkdir(parents=True, exist_ok=True)
         stage = backup.with_name(f".{backup.name}.stage-{uuid.uuid4().hex}.tmp")
+        stage_identity: Optional[os.stat_result] = None
+        stage_expected_bytes: Optional[bytes] = None
+        verified_backup: Optional[pathlib.Path] = None
         try:
             with stage.open("xb") as f:
+                stage_identity = stage.lstat()
                 f.write(source_bytes)
                 f.flush()
                 os.fsync(f.fileno())
             if stage.read_bytes() != source_bytes:
                 raise RuntimeError(f"staged backup verification failed: {backup.name}")
+            stage_expected_bytes = source_bytes
             try:
                 _publish_no_clobber(stage, backup)
             except FileExistsError:
                 continue
             if backup.read_bytes() == source_bytes:
                 fsync_parent_directory(backup)
+                verified_backup = backup
                 return backup
             # A concurrently replaced numbered path is not ours to delete.
         finally:
-            try:
-                stage.unlink()
-            except FileNotFoundError:
-                pass
+            active_error = sys.exc_info()[1]
+            cleanup_error = _cleanup_owned_file(
+                stage,
+                identity=stage_identity,
+                expected_bytes=stage_expected_bytes,
+                owner_label="backup stage",
+            )
+            if cleanup_error is not None:
+                message = f"backup staging cleanup failed: {cleanup_error}"
+                if verified_backup is not None:
+                    message += f"; verified backup retained as {verified_backup.name}"
+                if active_error is not None:
+                    raise RuntimeError(f"{active_error}; {message}") from active_error
+                raise RuntimeError(message)
     raise RuntimeError(f"could not find free backup name for {path}")
 
 
@@ -2030,6 +2089,105 @@ def create_backup(path: pathlib.Path, backup_dir: Optional[pathlib.Path] = None)
     return _exclusive_backup_from_bytes(path, path.read_bytes(), backup_dir=backup_dir)
 
 
+def _preflight_hardlink_support(directory: pathlib.Path, label: str) -> None:
+    """Verify hard links in one publication directory before live replacement writes."""
+    token = uuid.uuid4().hex
+    probe_source = directory / f".cjc-hardlink-probe-{token}.source.tmp"
+    probe_link = directory / f".cjc-hardlink-probe-{token}.link.tmp"
+    marker = f"claude-jsonl-compressor hard-link probe {token}\n".encode("ascii")
+    source_created = False
+    link_created = False
+    source_identity: Optional[os.stat_result] = None
+    link_identity: Optional[os.stat_result] = None
+    operation_error: Optional[Tuple[str, Exception]] = None
+    cleanup_errors: List[str] = []
+
+    try:
+        phase = "probe source creation"
+        with probe_source.open("xb") as stream:
+            source_created = True
+            stream.write(marker)
+            stream.flush()
+            os.fsync(stream.fileno())
+        source_identity = probe_source.lstat()
+
+        phase = "hard-link creation"
+        os.link(probe_source, probe_link)
+        link_created = True
+        link_identity = probe_link.lstat()
+
+        phase = "hard-link verification"
+        if source_identity is None or link_identity is None:
+            raise RuntimeError("probe identity was not captured")
+        if not os.path.samestat(source_identity, link_identity):
+            raise RuntimeError("probe destination does not reference the probe source")
+        if not os.path.samefile(probe_source, probe_link):
+            raise RuntimeError("probe destination does not reference the probe source")
+        if probe_link.read_bytes() != marker:
+            raise RuntimeError("probe hard-link bytes differ from the probe source")
+    except Exception as exc:
+        operation_error = (phase, exc)
+    finally:
+        if link_created:
+            cleanup_error = _cleanup_owned_file(
+                probe_link,
+                identity=link_identity,
+                expected_bytes=marker,
+                owner_label="probe",
+                missing_is_error=True,
+            )
+            if cleanup_error is not None:
+                cleanup_errors.append(cleanup_error)
+        else:
+            try:
+                probe_link.lstat()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                cleanup_errors.append(
+                    f"{probe_link.name}: could not inspect destination after link failure; "
+                    f"{_filesystem_error_detail(exc)}"
+                )
+            else:
+                cleanup_errors.append(f"{probe_link.name}: destination was claimed after link failure")
+
+        if source_created:
+            cleanup_error = _cleanup_owned_file(
+                probe_source,
+                identity=source_identity,
+                expected_bytes=marker,
+                owner_label="probe",
+                missing_is_error=True,
+            )
+            if cleanup_error is not None:
+                cleanup_errors.append(cleanup_error)
+
+        # Directory durability is best effort everywhere else in this module.
+        fsync_parent_directory(probe_source)
+
+    if cleanup_errors:
+        operation_detail = ""
+        if operation_error is not None:
+            operation_detail = (
+                f"; operation_error during {operation_error[0]}={_filesystem_error_detail(operation_error[1])}"
+            )
+        raise RuntimeError(
+            f"{label} hard-link preflight cleanup failed before live replacement; "
+            "the target file was not moved or replaced; "
+            f"retained probe detail={'; '.join(cleanup_errors)}{operation_detail}"
+        ) from (operation_error[1] if operation_error is not None else None)
+
+    if operation_error is not None:
+        phase, error = operation_error
+        raise RuntimeError(
+            f"{label} hard-link preflight failed before live replacement; "
+            "the target file was not moved or replaced; "
+            f"phase={phase}; cause={_filesystem_error_detail(error)}"
+        ) from error
+
+
+def _preflight_target_volume_hardlink_support(target_path: pathlib.Path) -> None:
+    _preflight_hardlink_support(target_path.parent, "target-volume")
 
 
 def _publish_no_clobber(source_path: pathlib.Path, destination_path: pathlib.Path) -> None:
@@ -2042,7 +2200,8 @@ def _publish_no_clobber(source_path: pathlib.Path, destination_path: pathlib.Pat
         raise
     except OSError as exc:
         raise RuntimeError(
-            "atomic no-clobber publication requires same-volume hard-link support"
+            "atomic no-clobber publication requires same-volume hard-link support; "
+            f"os.link={_filesystem_error_detail(exc)}"
         ) from exc
     fsync_parent_directory(destination_path)
 
@@ -2072,6 +2231,7 @@ def _restore_capture_no_clobber(
     *,
     validate_jsonl: bool,
 ) -> None:
+    capture_identity = capture_path.lstat()
     _publish_no_clobber(capture_path, target_path)
     restored_bytes = target_path.read_bytes()
     if restored_bytes != expected_bytes:
@@ -2080,11 +2240,14 @@ def _restore_capture_no_clobber(
         validation = validate_jsonl_bytes(restored_bytes, source_label=target_path.name)
         if not validation.get("ok"):
             raise RuntimeError(f"restored source validation failed: {validation.get('errors')}")
-    try:
-        if os.path.samefile(capture_path, target_path):
-            capture_path.unlink()
-    except (FileNotFoundError, OSError):
-        pass
+    cleanup_error = _cleanup_owned_file(
+        capture_path,
+        identity=capture_identity,
+        expected_bytes=expected_bytes,
+        owner_label="restored capture",
+    )
+    if cleanup_error is not None:
+        raise RuntimeError(f"restored capture cleanup failed: {cleanup_error}")
     fsync_parent_directory(target_path)
 
 
@@ -2108,22 +2271,34 @@ def _replace_file_after_validation(
     source_sha256 = sha256_hex(source_bytes)
     if expected_source_sha256 is not None and source_sha256 != expected_source_sha256:
         raise RuntimeError("input JSONL changed after candidate generation; original file was not replaced")
+    _preflight_target_volume_hardlink_support(target_path)
+    if backup_dir is not None:
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        _preflight_hardlink_support(backup_dir, "backup-directory")
     tmp_replace = target_path.with_name(f".{target_path.name}.replace-{uuid.uuid4().hex}.tmp")
     old_capture = target_path.with_name(f".{target_path.name}.old-{uuid.uuid4().hex}.tmp")
+    tmp_replace_identity: Optional[os.stat_result] = None
+    tmp_replace_expected_bytes: Optional[bytes] = None
+    old_capture_identity: Optional[os.stat_result] = None
+    rollback_capture_identity: Optional[os.stat_result] = None
     backup: Optional[pathlib.Path] = None
     published = False
     directory_fsync = False
     retain_old_capture = False
     external_target_preserved = False
     retained_rollback_capture: Optional[pathlib.Path] = None
+    rollback_capture: Optional[pathlib.Path] = None
+    cleanup_errors: List[Dict[str, str]] = []
     replaced_validation: Dict[str, Any] = {}
     try:
         with tmp_replace.open("xb") as f:
+            tmp_replace_identity = tmp_replace.lstat()
             f.write(candidate_bytes)
             f.flush()
             os.fsync(f.fileno())
         if sha256_hex(tmp_replace.read_bytes()) != candidate_sha256:
             raise RuntimeError("staged replacement bytes do not match the validated candidate snapshot")
+        tmp_replace_expected_bytes = candidate_bytes
         if target_path.read_bytes() != source_bytes:
             raise RuntimeError("input JSONL changed before backup; original file was not replaced")
         backup = _exclusive_backup_from_bytes(target_path, source_bytes, backup_dir=backup_dir)
@@ -2134,15 +2309,11 @@ def _replace_file_after_validation(
         captured_bytes = old_capture.read_bytes()
         if captured_bytes != source_bytes:
             raise RuntimeError("input JSONL changed during replacement capture; candidate was not installed")
+        old_capture_identity = old_capture.lstat()
         if target_path.exists():
             raise RuntimeError("input JSONL was recreated concurrently; external bytes were left in place")
         _publish_no_clobber(tmp_replace, target_path)
         published = True
-        try:
-            if os.path.samefile(tmp_replace, target_path):
-                tmp_replace.unlink()
-        except (FileNotFoundError, OSError):
-            pass
         directory_fsync = fsync_parent_directory(target_path) or directory_fsync
         published_bytes = target_path.read_bytes()
         if sha256_hex(published_bytes) != candidate_sha256:
@@ -2153,8 +2324,6 @@ def _replace_file_after_validation(
         backup = _ensure_verified_source_backup(target_path, source_bytes, backup, backup_dir)
         if old_capture.read_bytes() != source_bytes:
             raise RuntimeError("retained source capture changed before successful cleanup")
-        old_capture.unlink()
-        directory_fsync = fsync_parent_directory(target_path) or directory_fsync
     except Exception as exc:
         rollback_error: Optional[Exception] = None
         restored = False
@@ -2180,6 +2349,7 @@ def _replace_file_after_validation(
                     except FileNotFoundError:
                         rollback_capture = None
                     if rollback_capture is not None:
+                        rollback_capture_identity = rollback_capture.lstat()
                         actual_target_bytes = rollback_capture.read_bytes()
                         if actual_target_bytes == candidate_bytes:
                             try:
@@ -2190,11 +2360,12 @@ def _replace_file_after_validation(
                                     validate_jsonl=True,
                                 )
                                 restored = True
-                                if rollback_capture.read_bytes() == candidate_bytes:
-                                    rollback_capture.unlink()
                             except FileExistsError:
                                 external_target_preserved = True
                                 retained_rollback_capture = rollback_capture
+                            except Exception:
+                                retained_rollback_capture = rollback_capture
+                                raise
                         else:
                             external_target_preserved = True
                             try:
@@ -2206,16 +2377,15 @@ def _replace_file_after_validation(
                                 )
                             except FileExistsError:
                                 retained_rollback_capture = rollback_capture
+                            except Exception:
+                                retained_rollback_capture = rollback_capture
+                                raise
                             if backup is None or backup.read_bytes() != source_bytes:
                                 raise RuntimeError("verified source backup is unavailable during concurrent-target recovery")
-                            if old_capture.read_bytes() == source_bytes:
-                                old_capture.unlink()
                 elif target_path.exists():
                     external_target_preserved = True
                     if backup is None or backup.read_bytes() != source_bytes:
                         raise RuntimeError("verified source backup is unavailable during concurrent-target recovery")
-                    if old_capture.read_bytes() == source_bytes:
-                        old_capture.unlink()
                 else:
                     try:
                         _restore_capture_no_clobber(
@@ -2250,14 +2420,37 @@ def _replace_file_after_validation(
             raise RuntimeError(f"replacement failed and original bytes were restored: {exc}") from exc
         raise
     finally:
-        transients = [tmp_replace]
+        active_error = sys.exc_info()[1]
+        transients = [
+            (tmp_replace, tmp_replace_identity, tmp_replace_expected_bytes, "replacement stage"),
+        ]
         if not retain_old_capture:
-            transients.append(old_capture)
-        for transient in transients:
-            try:
-                transient.unlink()
-            except FileNotFoundError:
-                pass
+            transients.append((old_capture, old_capture_identity, source_bytes, "source capture"))
+        if rollback_capture is not None and retained_rollback_capture is None:
+            transients.append((rollback_capture, rollback_capture_identity, candidate_bytes, "rollback capture"))
+        removed_transient = False
+        for transient, identity, expected_bytes, owner_label in transients:
+            cleanup_error = _cleanup_owned_file(
+                transient,
+                identity=identity,
+                expected_bytes=expected_bytes,
+                owner_label=owner_label,
+            )
+            if cleanup_error is None:
+                if identity is not None:
+                    removed_transient = True
+            else:
+                cleanup_errors.append(
+                    {
+                        "path": transient.name,
+                        "error": cleanup_error,
+                    }
+                )
+        if removed_transient:
+            directory_fsync = fsync_parent_directory(target_path) or directory_fsync
+        if cleanup_errors and active_error is not None:
+            cleanup_detail = json.dumps(cleanup_errors, ensure_ascii=False, separators=(",", ":"))
+            raise RuntimeError(f"{active_error}; replacement cleanup errors={cleanup_detail}") from active_error
     if backup is None:
         raise AssertionError("replacement completed without an auditable backup")
     return {
@@ -2267,6 +2460,8 @@ def _replace_file_after_validation(
         "candidate_sha256": candidate_sha256,
         "published_sha256": candidate_sha256,
         "parent_directory_fsync": directory_fsync,
+        "operation_state": "committed-cleanup-failed" if cleanup_errors else "committed",
+        "cleanup_errors": cleanup_errors,
     }
 
 
@@ -7662,6 +7857,7 @@ def write_sidecars(output_path: pathlib.Path, report: Dict[str, Any]) -> None:
         "",
         f"- Input: `{report['input']}`",
         f"- Output: `{report['output']}`",
+        f"- Operation state: {report.get('operation_state') or 'candidate'}",
         f"- Package version: {report.get('package_version')}",
         f"- Compression engine: {report.get('codex_offline_compression_version')}",
         f"- Model-pack schema: {report.get('model_pack_schema_version')}",
@@ -7717,6 +7913,7 @@ def write_sidecars(output_path: pathlib.Path, report: Dict[str, Any]) -> None:
         f"- Replacement target: `{report.get('replacement_target') or ''}`",
         f"- Replacement backup: `{report.get('replacement_backup') or ''}`",
         f"- Replacement candidate: `{report.get('replacement_candidate') or ''}`",
+        f"- Replacement cleanup errors: {json.dumps(report.get('replacement_cleanup_errors') or [], ensure_ascii=False)}",
         "",
         "## Validation",
         "",
@@ -8036,6 +8233,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             report["replacement_candidate_sha256"] = replacement["candidate_sha256"]
             report["replacement_published_sha256"] = replacement["published_sha256"]
             report["replacement_parent_directory_fsync"] = replacement["parent_directory_fsync"]
+            report["operation_state"] = replacement["operation_state"]
+            report["replacement_cleanup_errors"] = replacement["cleanup_errors"]
             try:
                 write_sidecars(output_path, report)
             except Exception as report_exc:
@@ -8048,12 +8247,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "candidate_sha256": replacement.get("candidate_sha256"),
                     "published_sha256": replacement.get("published_sha256"),
                     "replacement_validation_ok": bool(replaced_validation.get("ok")),
+                    "prior_operation_state": report.get("operation_state"),
+                    "replacement_cleanup_errors": report.get("replacement_cleanup_errors", []),
                     "report_error": f"{type(report_exc).__name__}: {report_exc}",
                 }
                 print(json.dumps(receipt, ensure_ascii=False, indent=2))
                 eprint(
                     "ERROR: live replacement committed, but final sidecar/report publication failed: "
                     f"{report_exc}"
+                )
+                return 3
+            if report.get("operation_state") == "committed-cleanup-failed":
+                print(json.dumps(report, ensure_ascii=False, indent=2))
+                eprint(
+                    "ERROR: live replacement committed, but transaction cleanup failed; "
+                    "inspect replacement_cleanup_errors and remove only the listed residuals after verification."
                 )
                 return 3
         print(json.dumps(report, ensure_ascii=False, indent=2))

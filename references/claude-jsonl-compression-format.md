@@ -525,6 +525,19 @@ does not overwrite the external target. It preserves the verified numbered
 backup and, when necessary, places the captured original in another numbered
 backup, then fails without publishing the candidate.
 
+Before any live staging, backup payload publication, or target move, the
+implementation probes file hard-link support in the target directory and, when
+configured, the external backup directory. The probe itself briefly creates
+and removes unique dot-prefixed temporary files. Every unique live-transaction
+temporary path records its observed filesystem identity and frozen bytes.
+Cleanup rechecks both and retains a detected mismatch. A mismatch after commit is reported as
+`committed-cleanup-failed`; a mismatch while an earlier transaction failure is
+already active is appended to that failure. This is a best-effort race check,
+not a portable atomic identity-bound delete: standard Python pathname cleanup
+cannot eliminate a replacement between its final check and `unlink()` across
+Windows, Linux, and macOS. Live operation assumes Claude Code is closed and no
+other writer is manipulating the session directory.
+
 Candidate-mode reports are written with the candidate. Live compression delays
 its final sidecar/report until replacement metadata is available, so it does not
 leave a stale pre-commit report. If the JSONL commits and validates but final

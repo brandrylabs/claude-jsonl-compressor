@@ -529,6 +529,40 @@ class TestTransactionAndRepairContracts(ProtocolBase):
         self.assertEqual(calls, 1, "live compression wrote a stale pre-commit sidecar")
         self.assertTrue(live.with_suffix(live.suffix + ".backup").exists())
 
+    def test_live_compression_reports_committed_state_when_transaction_cleanup_fails(self):
+        session_id = "13131313-dddd-4131-8131-131313131313"
+        live = self._live_source(session_id)
+        original = live.read_bytes()
+        work = self.tmp / "work-compress-cleanup"
+        real_unlink = pathlib.Path.unlink
+
+        def fail_replacement_cleanup(path, *args, **kwargs):
+            if f".{live.name}.replace-" in path.name:
+                raise PermissionError("synthetic committed cleanup failure")
+            return real_unlink(path, *args, **kwargs)
+
+        stdout = io.StringIO()
+        try:
+            with mock.patch.object(pathlib.Path, "unlink", new=fail_replacement_cleanup):
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+                    code = ccj.main([
+                        "--input", str(live), "--replace-original", "--confirm-session-closed",
+                        "--work-dir", str(work), "--summary-char-budget", "4000",
+                        "--min-recent-records", "6", "--target-ratio", "0.20",
+                        "--deterministic-summary",
+                    ])
+            self.assertEqual(code, 3, stdout.getvalue())
+            state = json.loads(stdout.getvalue())
+            self.assertEqual(state["operation_state"], "committed-cleanup-failed")
+            self.assertNotEqual(live.read_bytes(), original)
+            self.assertTrue(live.with_suffix(live.suffix + ".backup").exists())
+            self.assertTrue(state["replacement_cleanup_errors"])
+            self.assertEqual(len(list(live.parent.glob(f".{live.name}.replace-*.tmp"))), 1)
+        finally:
+            for residue in live.parent.glob(f".{live.name}.replace-*.tmp"):
+                if residue.exists():
+                    real_unlink(residue)
+
     def test_live_repair_reports_committed_state_when_report_fails(self):
         session_id = "23232323-eeee-4232-8232-232323232323"
         live = self._repair_live_source(session_id)
@@ -546,6 +580,38 @@ class TestTransactionAndRepairContracts(ProtocolBase):
         state = json.loads(stdout.getvalue())
         self.assertEqual(state["operationState"], "committed-report-failed")
         self.assertTrue(live.with_suffix(live.suffix + ".backup").exists())
+
+    def test_live_repair_reports_committed_state_when_transaction_cleanup_fails(self):
+        session_id = "24242424-eeee-4242-8242-242424242424"
+        live = self._repair_live_source(session_id)
+        original = live.read_bytes()
+        work = self.tmp / "work-repair-cleanup"
+        real_unlink = pathlib.Path.unlink
+
+        def fail_replacement_cleanup(path, *args, **kwargs):
+            if f".{live.name}.replace-" in path.name:
+                raise PermissionError("synthetic committed cleanup failure")
+            return real_unlink(path, *args, **kwargs)
+
+        stdout = io.StringIO()
+        try:
+            with mock.patch.object(pathlib.Path, "unlink", new=fail_replacement_cleanup):
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+                    code = rcj.main([
+                        "--input", str(live), "--replace-original", "--confirm-session-closed",
+                        "--work-dir", str(work), "--expect-matches", "1",
+                    ])
+            self.assertEqual(code, 3, stdout.getvalue())
+            state = json.loads(stdout.getvalue())
+            self.assertEqual(state["operationState"], "committed-cleanup-failed")
+            self.assertNotEqual(live.read_bytes(), original)
+            self.assertTrue(live.with_suffix(live.suffix + ".backup").exists())
+            self.assertTrue(state["replacementCleanupErrors"])
+            self.assertEqual(len(list(live.parent.glob(f".{live.name}.replace-*.tmp"))), 1)
+        finally:
+            for residue in live.parent.glob(f".{live.name}.replace-*.tmp"):
+                if residue.exists():
+                    real_unlink(residue)
 
     def test_repair_candidate_requires_full_transcript_validation(self):
         fixture = RepairBase(methodName="runTest")

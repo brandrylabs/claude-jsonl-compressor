@@ -2,6 +2,21 @@
 
 Notable public changes are recorded here. This project follows Semantic Versioning.
 
+## [Unreleased]
+
+### Fixed
+
+- Preflight file hard-link capability in the target directory and any explicit
+  backup directory before a live session is staged, backed up, or moved.
+- Retain and report live-transaction temporary paths whose observed identity or
+  bytes change before cleanup, including cleanup residue after an earlier
+  transaction failure.
+
+### Changed
+
+- Run the hard-link and transaction suite on Windows, Linux, and macOS CI
+  runner volumes and print their filesystem type as diagnostic evidence.
+
 ## [1.0.0-rc.1] - 2026-07-28
 
 Initial public release candidate.
@@ -24,4 +39,5 @@ Initial public release candidate.
 - Live replacement handles one closed session at a time and requires Python 3.10 or newer.
 - Parent-directory durability is best effort where the platform does not support directory fsync.
 
+[Unreleased]: https://github.com/brandrylabs/claude-jsonl-compressor/compare/v1.0.0-rc.1...HEAD
 [1.0.0-rc.1]: https://github.com/brandrylabs/claude-jsonl-compressor/releases/tag/v1.0.0-rc.1

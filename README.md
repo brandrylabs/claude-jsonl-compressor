@@ -100,15 +100,19 @@ Excluded records appear in reports only as counts and digests. Their text is not
 - Python 3.10 or newer
 - Node.js 22 or newer only when using the npm command wrappers
 - Claude Code is optional; it is needed only for an explicitly requested runtime `/resume` or `/context` smoke test
-- Hard-link support on the volume holding the target file, for `--replace-original` only
+- Hard-link support on the volume holding the target file, and on an explicitly configured backup directory, for `--replace-original` only
 
 No Python package installation is required.
 
 ### Hard-link requirement for live replacement
 
-`--replace-original` publishes the candidate with `os.link` so that it never overwrites a concurrent claimant, and the rollback path restores the captured original the same way. Both therefore require hard-link support on the volume holding the session file.
+`--replace-original` publishes the candidate with `os.link` so that it never overwrites a concurrent claimant, and the rollback path restores the captured original the same way. The target directory must therefore support file hard links. An explicitly supplied `--backup-dir` also publishes numbered backups with a hard link and must support the same operation.
 
-The compressor probes this before it stages, backs up or moves anything. If the filesystem rejects `os.link`, the run stops with the target still in place and nothing written. Filesystems that typically cannot satisfy the requirement include FAT32/exFAT removable media, some SMB/NFS mounts and some container bind mounts. NTFS and ext4 are fine.
+Before live replacement staging, backup payload publication, or target movement, the compressor runs a unique, same-directory hard-link probe on the target volume. The probe briefly creates two dot-prefixed temporary files and removes them; a cleanup failure is reported with the retained probe name and stops the live operation. If the capability probe fails, the target remains at its original path and byte content, and no live replacement stage, backup payload, or target move has started. This probe is a capability check, not a guarantee against a later permission, quota, network, or concurrency failure; late publication, rollback, and cleanup failures are reported with their transaction state and verified recovery assets.
+
+Each unique live-transaction temporary path is checked against its recorded filesystem identity and frozen bytes before cleanup. A detected mismatch is retained and reported as `committed-cleanup-failed` after a committed candidate, or alongside the primary failure before commit. Portable Python cannot bind the final pathname `unlink` atomically to that earlier identity check across Windows, Linux, and macOS. Run live replacement only with the session closed and no other writer; hostile same-account directory manipulation is outside this guarantee.
+
+NTFS, APFS, ext4, XFS, and btrfs commonly support file hard links, while FAT/exFAT, some network shares, overlay or bind-mounted filesystems, and Windows ReFS may reject them. The probe is authoritative for the actual directory and account; the filesystem name alone is not treated as a guarantee. The repository CI runs the probe and transaction tests on Windows, Linux, and macOS runner volumes.
 
 Candidate output is unaffected: it publishes through `os.replace` and has no hard-link dependency.
 

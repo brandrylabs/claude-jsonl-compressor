@@ -582,6 +582,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             report["replacementCandidateSha256"] = replacement["candidate_sha256"]
             report["replacementPublishedSha256"] = replacement["published_sha256"]
             report["replacementParentDirectoryFsync"] = replacement["parent_directory_fsync"]
+            report["operationState"] = replacement["operation_state"]
+            report["replacementCleanupErrors"] = replacement["cleanup_errors"]
         report_path = output_path.with_suffix(output_path.suffix + ".repair.json")
         try:
             ccj.atomic_write_text(report_path, json.dumps(report, ensure_ascii=False, indent=2) + "\n")
@@ -596,6 +598,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "candidateSha256": report.get("replacementCandidateSha256"),
                     "publishedSha256": report.get("replacementPublishedSha256"),
                     "replacementValidationOk": bool((report.get("replacementValidation") or {}).get("ok")),
+                    "priorOperationState": report.get("operationState"),
+                    "replacementCleanupErrors": report.get("replacementCleanupErrors", []),
                     "reportError": f"{type(report_exc).__name__}: {report_exc}",
                 }
                 print(json.dumps(receipt, ensure_ascii=False, indent=2))
@@ -605,6 +609,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 )
                 return 3
             raise
+        if report.get("operationState") == "committed-cleanup-failed":
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            ccj.eprint(
+                "ERROR: live repair committed, but transaction cleanup failed; "
+                "inspect replacementCleanupErrors and remove only the listed residuals after verification."
+            )
+            return 3
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0
     except Exception as exc:

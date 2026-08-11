@@ -21,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-15-intel]
         python-version: ['3.10', '3.11', '3.12', '3.13', '3.14']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -35,6 +35,37 @@ jobs:
 
       - name: Report interpreter
         run: python -VV
+
+      - name: Report filesystem (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          printf 'runner_os=%s\n' "$RUNNER_OS"
+          stat -f -c 'workspace_filesystem=%T' "$GITHUB_WORKSPACE"
+          stat -f -c 'runner_temp_filesystem=%T' "$RUNNER_TEMP"
+
+      - name: Report filesystem (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          printf 'runner_os=%s\n' "$RUNNER_OS"
+          stat -f 'workspace_filesystem=%T' "$GITHUB_WORKSPACE"
+          stat -f 'runner_temp_filesystem=%T' "$RUNNER_TEMP"
+
+      - name: Report filesystem (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $workspace = (Resolve-Path $env:GITHUB_WORKSPACE).Path
+          $root = [System.IO.Path]::GetPathRoot($workspace)
+          $drive = [System.IO.DriveInfo]::new($root)
+          $tempRoot = [System.IO.Path]::GetPathRoot($env:RUNNER_TEMP)
+          $tempDrive = [System.IO.DriveInfo]::new($tempRoot)
+          "runner_os=$env:RUNNER_OS"
+          "workspace_root=$root"
+          "workspace_filesystem=$($drive.DriveFormat)"
+          "runner_temp_root=$tempRoot"
+          "runner_temp_filesystem=$($tempDrive.DriveFormat)"
 
       - name: Byte-compile scripts and tests
         shell: bash

@@ -133,6 +133,17 @@ exercise standalone entry points. Release verification also runs CLI smoke tests
   replacement, and post-validation stages.
 - Live commit followed by report failure returns exit code 3 and a
   `committed-report-failed` receipt instead of pretending no commit occurred.
+- A hard-link capability probe runs separately in the target directory and an
+  explicitly configured backup directory before live staging or target movement.
+  Probe cleanup failures and late committed cleanup failures are reported with
+  residual names and `committed-cleanup-failed`; candidate mode never runs the
+  probe. The native probe and transaction suite run on Windows, Linux, and
+  macOS CI runner volumes, whose filesystem type is printed as evidence.
+- The suite also locks the ownership-aware temporary cleanup rule: recorded
+  identity and bytes must still match before a probe, backup stage, source
+  capture, replacement stage, or rollback capture is removed. Detected
+  mismatches are retained and reported; portable pathname cleanup still has a
+  documented final-check-to-unlink race boundary.
 
 ### Repair and release behavior
 

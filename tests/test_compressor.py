@@ -22,6 +22,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import pathlib
 import random
 import re
@@ -44,6 +45,13 @@ class CompressBase(unittest.TestCase):
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
+
+    @staticmethod
+    def replacement_stat(identity: os.stat_result) -> os.stat_result:
+        """Return an observable replacement identity without relying on inode reuse."""
+        fields = list(identity)
+        fields[1] = identity.st_ino + 1
+        return os.stat_result(fields)
 
     def compress(self, src_records, out_name="out.jsonl", **kwargs):
         src = fx.write_jsonl(self.tmp / "src.jsonl", src_records)
@@ -2854,6 +2862,427 @@ class TestValidator(CompressBase):
 
 
 class TestTransactionalWrites(CompressBase):
+    def test_target_volume_hardlink_preflight_cleans_probe_files(self):
+        target = self.tmp / "target-volume" / "session.jsonl"
+        target.parent.mkdir()
+        target.write_bytes(b"original-session-bytes")
+
+        ccj._preflight_target_volume_hardlink_support(target)
+
+        self.assertEqual(target.read_bytes(), b"original-session-bytes")
+        self.assertEqual(list(target.parent.glob(".cjc-hardlink-probe-*.tmp")), [])
+
+    def test_target_volume_hardlink_rejection_stops_before_staging_backup_or_move(self):
+        session_id = "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1"
+        target = fx.write_jsonl(
+            self.tmp / "target-volume" / f"{session_id}.jsonl",
+            fx.build_linear(session_id, turns=25).records,
+        )
+        candidate = fx.write_jsonl(
+            self.tmp / "work" / "candidate.jsonl",
+            fx.build_linear(session_id, turns=30).records,
+        )
+        backup_dir = self.tmp / "external-backup-volume"
+        original = target.read_bytes()
+        real_link = ccj.os.link
+
+        def reject_target_volume(source, destination, *args, **kwargs):
+            destination_path = pathlib.Path(destination)
+            if destination_path.parent == target.parent:
+                raise OSError("synthetic target-volume hard-link rejection")
+            return real_link(source, destination, *args, **kwargs)
+
+        with mock.patch.object(ccj.os, "link", side_effect=reject_target_volume):
+            with mock.patch.object(ccj, "_exclusive_backup_from_bytes", wraps=ccj._exclusive_backup_from_bytes) as backup:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "hard-link preflight failed.*synthetic target-volume hard-link rejection",
+                ):
+                    ccj._replace_file_after_validation(candidate, target, backup_dir=backup_dir)
+
+        backup.assert_not_called()
+        self.assertEqual(target.read_bytes(), original)
+        self.assertFalse(backup_dir.exists())
+        self.assertEqual(list(target.parent.glob(f".{target.name}.replace-*.tmp")), [])
+        self.assertEqual(list(target.parent.glob(f".{target.name}.old-*.tmp")), [])
+        self.assertEqual(list(target.parent.glob(".cjc-hardlink-probe-*.tmp")), [])
+
+    def test_target_volume_hardlink_preflight_reports_cleanup_failure(self):
+        target = self.tmp / "cleanup-volume" / "session.jsonl"
+        target.parent.mkdir()
+        target.write_bytes(b"original-session-bytes")
+        real_unlink = pathlib.Path.unlink
+        retained_probe_links = []
+
+        def fail_probe_link_cleanup(path, *args, **kwargs):
+            if ".cjc-hardlink-probe-" in path.name and path.name.endswith(".link.tmp"):
+                retained_probe_links.append(path)
+                raise PermissionError("synthetic probe cleanup failure")
+            return real_unlink(path, *args, **kwargs)
+
+        try:
+            with mock.patch.object(pathlib.Path, "unlink", new=fail_probe_link_cleanup):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "hard-link preflight cleanup failed.*synthetic probe cleanup failure",
+                ):
+                    ccj._preflight_target_volume_hardlink_support(target)
+            self.assertEqual(target.read_bytes(), b"original-session-bytes")
+            self.assertEqual(len(retained_probe_links), 1)
+            self.assertTrue(retained_probe_links[0].exists())
+            self.assertEqual(
+                    list(target.parent.glob(".cjc-hardlink-probe-*.source.tmp")),
+                [],
+            )
+        finally:
+            for retained in retained_probe_links:
+                if retained.exists():
+                    real_unlink(retained)
+
+    def test_target_volume_hardlink_preflight_reports_source_disappearance(self):
+        target = self.tmp / "race-volume" / "session.jsonl"
+        target.parent.mkdir()
+        target.write_bytes(b"original-session-bytes")
+        real_lstat = pathlib.Path.lstat
+        real_unlink = pathlib.Path.unlink
+        calls = 0
+
+        def source_disappears_during_cleanup(path):
+            nonlocal calls
+            if path.name.endswith(".source.tmp"):
+                calls += 1
+            if path.name.endswith(".source.tmp") and calls == 2:
+                real_unlink(path)
+                raise FileNotFoundError("synthetic source disappearance")
+            return real_lstat(path)
+
+        with mock.patch.object(pathlib.Path, "lstat", new=source_disappears_during_cleanup):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "hard-link preflight cleanup failed.*source.tmp: disappeared before cleanup",
+            ):
+                ccj._preflight_target_volume_hardlink_support(target)
+        self.assertEqual(calls, 2)
+        self.assertEqual(list(target.parent.glob(".cjc-hardlink-probe-*.tmp")), [])
+
+    def test_target_volume_hardlink_preflight_preserves_same_byte_replacement(self):
+        target = self.tmp / "identity-race-volume" / "session.jsonl"
+        target.parent.mkdir()
+        target.write_bytes(b"original-session-bytes")
+        real_lstat = pathlib.Path.lstat
+        real_unlink = pathlib.Path.unlink
+        calls = 0
+
+        def replace_source_during_cleanup(path):
+            nonlocal calls
+            if path.name.endswith(".source.tmp"):
+                calls += 1
+            if path.name.endswith(".source.tmp") and calls == 2:
+                marker = path.read_bytes()
+                real_unlink(path)
+                path.write_bytes(marker)
+                return self.replacement_stat(real_lstat(path))
+            return real_lstat(path)
+
+        try:
+            with mock.patch.object(pathlib.Path, "lstat", new=replace_source_during_cleanup):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "hard-link preflight cleanup failed.*probe identity changed before cleanup",
+                ):
+                    ccj._preflight_target_volume_hardlink_support(target)
+            retained = list(target.parent.glob(".cjc-hardlink-probe-*.source.tmp"))
+            self.assertEqual(calls, 2)
+            self.assertEqual(len(retained), 1)
+        finally:
+            for residue in target.parent.glob(".cjc-hardlink-probe-*.tmp"):
+                if residue.exists():
+                    real_unlink(residue)
+
+    def test_backup_directory_hardlink_rejection_stops_before_backup_payload_or_move(self):
+        session_id = "a4a4a4a4-a4a4-a4a4-a4a4-a4a4a4a4a4a4"
+        target = fx.write_jsonl(
+            self.tmp / "target-volume" / f"{session_id}.jsonl",
+            fx.build_linear(session_id, turns=25).records,
+        )
+        candidate = fx.write_jsonl(
+            self.tmp / "work" / "backup-rejection-candidate.jsonl",
+            fx.build_linear(session_id, turns=30).records,
+        )
+        backup_dir = self.tmp / "external-backup-volume"
+        original = target.read_bytes()
+        real_link = ccj.os.link
+
+        def reject_backup_volume(source, destination, *args, **kwargs):
+            if pathlib.Path(destination).parent == backup_dir:
+                raise OSError("synthetic backup-directory hard-link rejection")
+            return real_link(source, destination, *args, **kwargs)
+
+        with mock.patch.object(ccj.os, "link", side_effect=reject_backup_volume):
+            with mock.patch.object(ccj, "_exclusive_backup_from_bytes", wraps=ccj._exclusive_backup_from_bytes) as backup:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "backup-directory hard-link preflight failed.*synthetic backup-directory hard-link rejection",
+                ):
+                    ccj._replace_file_after_validation(candidate, target, backup_dir=backup_dir)
+
+        backup.assert_not_called()
+        self.assertEqual(target.read_bytes(), original)
+        self.assertTrue(backup_dir.exists())
+        self.assertEqual(list(backup_dir.glob(".cjc-hardlink-probe-*.tmp")), [])
+        self.assertEqual(list(backup_dir.glob("*.backup*")), [])
+        self.assertEqual(list(target.parent.glob(f".{target.name}.replace-*.tmp")), [])
+        self.assertEqual(list(target.parent.glob(f".{target.name}.old-*.tmp")), [])
+
+    def test_external_backup_directory_success_keeps_a_verified_backup(self):
+        session_id = "a5a5a5a5-a5a5-a5a5-a5a5-a5a5a5a5a5a5"
+        target = fx.write_jsonl(
+            self.tmp / "target-volume" / f"{session_id}.jsonl",
+            fx.build_linear(session_id, turns=25).records,
+        )
+        candidate = fx.write_jsonl(
+            self.tmp / "work" / "external-backup-candidate.jsonl",
+            fx.build_linear(session_id, turns=30).records,
+        )
+        backup_dir = self.tmp / "external-backup-volume"
+        original = target.read_bytes()
+
+        result = ccj._replace_file_after_validation(candidate, target, backup_dir=backup_dir)
+
+        self.assertEqual(result["operation_state"], "committed")
+        self.assertEqual(result["backup_path"].parent, backup_dir)
+        self.assertEqual(result["backup_path"].read_bytes(), original)
+        self.assertNotEqual(target.read_bytes(), original)
+
+    def test_backup_stage_cleanup_failure_stops_before_target_capture(self):
+        session_id = "a9a9a9a9-a9a9-a9a9-a9a9-a9a9a9a9a9a9"
+        target = fx.write_jsonl(
+            self.tmp / f"{session_id}.jsonl",
+            fx.build_linear(session_id, turns=25).records,
+        )
+        candidate = fx.write_jsonl(
+            self.tmp / "backup-stage-cleanup-candidate.jsonl",
+            fx.build_linear(session_id, turns=30).records,
+        )
+        original = target.read_bytes()
+        real_unlink = pathlib.Path.unlink
+
+        def fail_backup_stage_cleanup(path, *args, **kwargs):
+            if f".{target.name}.backup.stage-" in path.name:
+                raise PermissionError("synthetic backup-stage cleanup failure")
+            return real_unlink(path, *args, **kwargs)
+
+        try:
+            with mock.patch.object(pathlib.Path, "unlink", new=fail_backup_stage_cleanup):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "backup staging cleanup failed.*synthetic backup-stage cleanup failure.*verified backup retained as",
+                ):
+                    ccj._replace_file_after_validation(candidate, target)
+            self.assertEqual(target.read_bytes(), original)
+            self.assertTrue(target.with_suffix(target.suffix + ".backup").exists())
+            self.assertEqual(list(target.parent.glob(f".{target.name}.old-*.tmp")), [])
+            self.assertEqual(len(list(target.parent.glob(f".{target.name}.backup.stage-*.tmp"))), 1)
+        finally:
+            for residue in target.parent.glob(f".{target.name}.backup.stage-*.tmp"):
+                if residue.exists():
+                    real_unlink(residue)
+
+    def test_backup_stage_cleanup_failure_keeps_primary_error(self):
+        session_id = "aaaaaaa1-aaaa-4aaa-8aaa-aaaaaaaaaaa1"
+        target = fx.write_jsonl(
+            self.tmp / f"{session_id}.jsonl",
+            fx.build_linear(session_id, turns=25).records,
+        )
+        candidate = fx.write_jsonl(
+            self.tmp / "backup-stage-primary-error-candidate.jsonl",
+            fx.build_linear(session_id, turns=30).records,
+        )
+        original = target.read_bytes()
+        real_publish = ccj._publish_no_clobber
+        real_unlink = pathlib.Path.unlink
+
+        def fail_backup_publication(source, destination):
+            if ".backup.stage-" in pathlib.Path(source).name:
+                raise OSError("synthetic backup publication failure")
+            return real_publish(source, destination)
+
+        def fail_backup_stage_cleanup(path, *args, **kwargs):
+            if ".backup.stage-" in path.name:
+                raise PermissionError("synthetic backup-stage cleanup failure")
+            return real_unlink(path, *args, **kwargs)
+
+        try:
+            with mock.patch.object(ccj, "_publish_no_clobber", side_effect=fail_backup_publication):
+                with mock.patch.object(pathlib.Path, "unlink", new=fail_backup_stage_cleanup):
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "synthetic backup publication failure; backup staging cleanup failed.*synthetic backup-stage cleanup failure",
+                    ):
+                        ccj._replace_file_after_validation(candidate, target)
+            self.assertEqual(target.read_bytes(), original)
+            self.assertEqual(len(list(target.parent.glob(f".{target.name}.backup.stage-*.tmp"))), 1)
+        finally:
+            for residue in target.parent.glob(f".{target.name}.backup.stage-*.tmp"):
+                if residue.exists():
+                    real_unlink(residue)
+
+    def test_candidate_publication_does_not_require_hardlinks(self):
+        session_id = "a2a2a2a2-a2a2-a2a2-a2a2-a2a2a2a2a2a2"
+        records = fx.build_linear(session_id, turns=20).records
+        destination = self.tmp / "candidate-output.jsonl"
+
+        with mock.patch.object(ccj.os, "link", side_effect=OSError("hard links unavailable")):
+            validation = ccj.publish_validated_jsonl(destination, records)
+
+        self.assertTrue(validation["ok"])
+        self.assertEqual(destination.read_bytes(), ccj.jsonl_bytes(records))
+
+    def test_committed_cleanup_failure_is_reported_without_rolling_back(self):
+        session_id = "a3a3a3a3-a3a3-a3a3-a3a3-a3a3a3a3a3a3"
+        target = fx.write_jsonl(
+            self.tmp / f"{session_id}.jsonl",
+            fx.build_linear(session_id, turns=25).records,
+        )
+        candidate = fx.write_jsonl(
+            self.tmp / "cleanup-candidate.jsonl",
+            fx.build_linear(session_id, turns=30).records,
+        )
+        original = target.read_bytes()
+        candidate_bytes = candidate.read_bytes()
+        real_unlink = pathlib.Path.unlink
+
+        def fail_replace_cleanup(path, *args, **kwargs):
+            if f".{target.name}.replace-" in path.name:
+                raise PermissionError("synthetic committed temp cleanup failure")
+            return real_unlink(path, *args, **kwargs)
+
+        try:
+            with mock.patch.object(pathlib.Path, "unlink", new=fail_replace_cleanup):
+                result = ccj._replace_file_after_validation(candidate, target)
+            self.assertEqual(result["operation_state"], "committed-cleanup-failed")
+            self.assertEqual(result["cleanup_errors"][0]["path"].split(".replace-")[0], f".{target.name}")
+            self.assertEqual(target.read_bytes(), candidate_bytes)
+            self.assertNotEqual(target.read_bytes(), original)
+            self.assertEqual(target.with_suffix(target.suffix + ".backup").read_bytes(), original)
+            self.assertEqual(len(list(target.parent.glob(f".{target.name}.replace-*.tmp"))), 1)
+        finally:
+            for residue in target.parent.glob(f".{target.name}.replace-*.tmp"):
+                if residue.exists():
+                    real_unlink(residue)
+
+    def test_committed_old_capture_cleanup_failure_is_reported_without_rolling_back(self):
+        session_id = "a6a6a6a6-a6a6-a6a6-a6a6-a6a6a6a6a6a6"
+        target = fx.write_jsonl(
+            self.tmp / f"{session_id}.jsonl",
+            fx.build_linear(session_id, turns=25).records,
+        )
+        candidate = fx.write_jsonl(
+            self.tmp / "old-capture-cleanup-candidate.jsonl",
+            fx.build_linear(session_id, turns=30).records,
+        )
+        original = target.read_bytes()
+        candidate_bytes = candidate.read_bytes()
+        real_unlink = pathlib.Path.unlink
+
+        def fail_old_capture_cleanup(path, *args, **kwargs):
+            if f".{target.name}.old-" in path.name:
+                raise PermissionError("synthetic committed old-capture cleanup failure")
+            return real_unlink(path, *args, **kwargs)
+
+        try:
+            with mock.patch.object(pathlib.Path, "unlink", new=fail_old_capture_cleanup):
+                result = ccj._replace_file_after_validation(candidate, target)
+            self.assertEqual(result["operation_state"], "committed-cleanup-failed")
+            self.assertEqual(result["cleanup_errors"][0]["path"].split(".old-")[0], f".{target.name}")
+            self.assertEqual(target.read_bytes(), candidate_bytes)
+            self.assertNotEqual(target.read_bytes(), original)
+            self.assertEqual(target.with_suffix(target.suffix + ".backup").read_bytes(), original)
+            self.assertEqual(len(list(target.parent.glob(f".{target.name}.old-*.tmp"))), 1)
+        finally:
+            for residue in target.parent.glob(f".{target.name}.old-*.tmp"):
+                if residue.exists():
+                    real_unlink(residue)
+
+    def test_committed_cleanup_preserves_same_byte_old_capture_replacement(self):
+        session_id = "a7a7a7a7-a7a7-a7a7-a7a7-a7a7a7a7a7a7"
+        target = fx.write_jsonl(
+            self.tmp / f"{session_id}.jsonl",
+            fx.build_linear(session_id, turns=25).records,
+        )
+        candidate = fx.write_jsonl(
+            self.tmp / "old-capture-identity-candidate.jsonl",
+            fx.build_linear(session_id, turns=30).records,
+        )
+        candidate_bytes = candidate.read_bytes()
+        real_lstat = pathlib.Path.lstat
+        real_unlink = pathlib.Path.unlink
+        old_capture_lstat_calls = 0
+
+        def replace_old_capture_before_cleanup(path):
+            nonlocal old_capture_lstat_calls
+            if f".{target.name}.old-" in path.name:
+                old_capture_lstat_calls += 1
+                if old_capture_lstat_calls == 2:
+                    captured_bytes = path.read_bytes()
+                    real_unlink(path)
+                    path.write_bytes(captured_bytes)
+                    return self.replacement_stat(real_lstat(path))
+            return real_lstat(path)
+
+        try:
+            with mock.patch.object(pathlib.Path, "lstat", new=replace_old_capture_before_cleanup):
+                result = ccj._replace_file_after_validation(candidate, target)
+            self.assertEqual(result["operation_state"], "committed-cleanup-failed")
+            self.assertIn("source capture identity changed before cleanup", result["cleanup_errors"][0]["error"])
+            self.assertEqual(target.read_bytes(), candidate_bytes)
+            self.assertEqual(old_capture_lstat_calls, 2)
+            self.assertEqual(len(list(target.parent.glob(f".{target.name}.old-*.tmp"))), 1)
+        finally:
+            for residue in target.parent.glob(f".{target.name}.old-*.tmp"):
+                if residue.exists():
+                    real_unlink(residue)
+
+    def test_failed_replacement_reports_tail_cleanup_residue(self):
+        session_id = "a8a8a8a8-a8a8-a8a8-a8a8-a8a8a8a8a8a8"
+        target = fx.write_jsonl(
+            self.tmp / f"{session_id}.jsonl",
+            fx.build_linear(session_id, turns=25).records,
+        )
+        candidate = fx.write_jsonl(
+            self.tmp / "failed-cleanup-candidate.jsonl",
+            fx.build_linear(session_id, turns=30).records,
+        )
+        original = target.read_bytes()
+        real_publish = ccj._publish_no_clobber
+        real_unlink = pathlib.Path.unlink
+
+        def fail_candidate_install(source, destination):
+            if ".replace-" in pathlib.Path(source).name and pathlib.Path(destination) == target:
+                raise OSError("synthetic candidate install failure")
+            return real_publish(source, destination)
+
+        def fail_stage_cleanup(path, *args, **kwargs):
+            if f".{target.name}.replace-" in path.name:
+                raise PermissionError("synthetic failed-transaction cleanup failure")
+            return real_unlink(path, *args, **kwargs)
+
+        try:
+            with mock.patch.object(ccj, "_publish_no_clobber", side_effect=fail_candidate_install):
+                with mock.patch.object(pathlib.Path, "unlink", new=fail_stage_cleanup):
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "original bytes were restored.*replacement cleanup errors=.*synthetic failed-transaction cleanup failure",
+                    ):
+                        ccj._replace_file_after_validation(candidate, target)
+            self.assertEqual(target.read_bytes(), original)
+            self.assertEqual(target.with_suffix(target.suffix + ".backup").read_bytes(), original)
+            self.assertEqual(len(list(target.parent.glob(f".{target.name}.replace-*.tmp"))), 1)
+        finally:
+            for residue in target.parent.glob(f".{target.name}.replace-*.tmp"):
+                if residue.exists():
+                    real_unlink(residue)
+
     def test_atomic_write_failure_preserves_existing_destination_and_cleans_temp(self):
         destination = self.tmp / "atomic.json"
         destination.write_bytes(b"old-bytes")
@@ -3071,24 +3500,29 @@ class TestTransactionalWrites(CompressBase):
         target = fx.write_jsonl(self.tmp / f"{session_id}.jsonl", fx.build_linear(session_id, turns=25).records)
         candidate = fx.write_jsonl(self.tmp / "rollback-failure.jsonl", fx.build_linear(session_id, turns=30).records)
         original = target.read_bytes()
-        real_replace = ccj.os.replace
+        real_publish = ccj._publish_no_clobber
 
         def fail_rollback(source, destination):
             if ".old-" in pathlib.Path(source).name and pathlib.Path(destination) == target:
-                raise OSError("synthetic rollback replace failure")
-            return real_replace(source, destination)
+                raise OSError("synthetic rollback hard-link failure")
+            return real_publish(source, destination)
 
         validations = [
             {"ok": True, "errors": []},
             {"ok": False, "errors": ["synthetic published validation failure"]},
         ]
         with mock.patch.object(ccj, "validate_jsonl_bytes", side_effect=validations):
-            with mock.patch.object(ccj.os, "replace", side_effect=fail_rollback):
-                with self.assertRaisesRegex(RuntimeError, "rollback also failed; retain backup"):
+            with mock.patch.object(ccj, "_publish_no_clobber", side_effect=fail_rollback):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "rollback also failed; retain backup.*synthetic rollback hard-link failure",
+                ):
                     ccj._replace_file_after_validation(candidate, target)
         backup = target.with_suffix(target.suffix + ".backup")
         self.assertTrue(backup.exists())
         self.assertEqual(backup.read_bytes(), original)
+        self.assertEqual(len(list(target.parent.glob(f".{target.name}.old-*.tmp"))), 1)
+        self.assertEqual(len(list(target.parent.glob(f".{target.name}.rollback-*.tmp"))), 1)
 
     def test_no_internal_fields_leak_to_output(self):
         tb = fx.build_linear("11111111-1111-1111-1111-111111111111", turns=40, with_tools_every=4)

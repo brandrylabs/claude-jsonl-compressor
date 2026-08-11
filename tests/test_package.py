@@ -150,6 +150,12 @@ class TestNpmPackage(unittest.TestCase):
         self.assertIn("permissions:\n  contents: read", workflow)
         self.assertEqual(workflow.count("persist-credentials: false"), 2)
         self.assertEqual(workflow.count("fail-fast: false"), 2)
+        self.assertIn("os: [ubuntu-latest, windows-latest, macos-15-intel]", workflow)
+        self.assertIn("Report filesystem (Linux)", workflow)
+        self.assertIn("Report filesystem (macOS)", workflow)
+        self.assertIn("Report filesystem (Windows)", workflow)
+        self.assertIn("workspace_filesystem=$($drive.DriveFormat)", workflow)
+        self.assertIn("runner_temp_filesystem=$($tempDrive.DriveFormat)", workflow)
 
     def test_manifest_has_no_runtime_dependencies_or_install_hooks(self):
         manifest = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))

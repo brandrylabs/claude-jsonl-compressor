@@ -26,7 +26,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 JsonObj = Dict[str, Any]
-PACKAGE_VERSION = "1.0.0-rc.1"
+PACKAGE_VERSION = "1.0.0"
 CODEX_OFFLINE_COMPRESSION_VERSION = "v10"
 MODEL_PACK_SCHEMA_VERSION = 11
 REPORT_SCHEMA_VERSION = 1

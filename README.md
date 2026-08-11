@@ -1,14 +1,10 @@
-<p align="center">
-  <a href="README.md"><img alt="English" src="https://img.shields.io/badge/English-2563eb?style=for-the-badge"></a>
-  <a href="docs/README.zh-CN.md"><img alt="简体中文" src="https://img.shields.io/badge/%E7%AE%80%E4%BD%93%E4%B8%AD%E6%96%87-6b7280?style=for-the-badge"></a>
-  <a href="docs/README.ja.md"><img alt="日本語" src="https://img.shields.io/badge/%E6%97%A5%E6%9C%AC%E8%AA%9E-6b7280?style=for-the-badge"></a>
-</p>
-
 # Claude JSONL Compressor
+
+[English](https://github.com/brandrylabs/claude-jsonl-compressor/blob/v1.0.0/README.md) | [简体中文](https://github.com/brandrylabs/claude-jsonl-compressor/blob/v1.0.0/docs/README.zh-CN.md) | [日本語](https://github.com/brandrylabs/claude-jsonl-compressor/blob/v1.0.0/docs/README.ja.md)
 
 Strict, model-assisted compression for one Claude Code session transcript, plus an independent byte-preserving compatibility repair for historical `Read.pages` records.
 
-**Release:** [`1.0.0-rc.1`](CHANGELOG.md)<br>
+**Release:** [`1.0.0`](CHANGELOG.md)<br>
 **Engine:** `v10`<br>
 **Model-pack schema:** `v11`<br>
 **License:** GPL-3.0-only<br>
@@ -153,10 +149,10 @@ The installed directory must contain `SKILL.md`, `scripts/`, `config/`, `templat
 
 ### Install The npm CLI
 
-After the RC is published:
+After version 1.0.0 is published:
 
 ```bash
-npm install --global @brandry/claude-jsonl-compressor@rc
+npm install --global @brandry/claude-jsonl-compressor
 ```
 
 This installs two commands:
@@ -171,7 +167,7 @@ The npm package is a zero-dependency Node shim over the bundled Python implement
 Upgrade or uninstall the global CLI:
 
 ```bash
-npm install --global @brandry/claude-jsonl-compressor@rc
+npm install --global @brandry/claude-jsonl-compressor
 npm update --global @brandry/claude-jsonl-compressor
 npm uninstall --global @brandry/claude-jsonl-compressor
 ```
@@ -179,7 +175,7 @@ npm uninstall --global @brandry/claude-jsonl-compressor
 Local development install and invocation:
 
 ```bash
-npm install --save-dev @brandry/claude-jsonl-compressor@rc
+npm install --save-dev @brandry/claude-jsonl-compressor
 npm update @brandry/claude-jsonl-compressor
 npm exec -- claude-jsonl-compressor --version
 npm exec -- claude-jsonl-repair-read-pages --version
@@ -189,15 +185,15 @@ npm uninstall @brandry/claude-jsonl-compressor
 Run without retaining an installation:
 
 ```bash
-npx --yes --package @brandry/claude-jsonl-compressor@rc claude-jsonl-compressor --version
-npx --yes --package @brandry/claude-jsonl-compressor@rc claude-jsonl-repair-read-pages --version
+npx --yes --package @brandry/claude-jsonl-compressor claude-jsonl-compressor --version
+npx --yes --package @brandry/claude-jsonl-compressor claude-jsonl-repair-read-pages --version
 ```
 
 Actual npm/npx operations use the same Python CLI options:
 
 ```bash
-npx --yes --package @brandry/claude-jsonl-compressor@rc claude-jsonl-compressor --input session.jsonl --write-model-pack run/session.model-pack.md
-npx --yes --package @brandry/claude-jsonl-compressor@rc claude-jsonl-repair-read-pages --input session.jsonl --scan-only
+npx --yes --package @brandry/claude-jsonl-compressor claude-jsonl-compressor --input session.jsonl --write-model-pack run/session.model-pack.md
+npx --yes --package @brandry/claude-jsonl-compressor claude-jsonl-repair-read-pages --input session.jsonl --scan-only
 ```
 
 ### Use From Source Without Installing
@@ -563,24 +559,24 @@ python -B -I -S scripts/compress_claude_jsonl.py --version
 python -B -I -S scripts/repair_claude_jsonl.py --version
 npm test
 npm pack --dry-run --json
-npm publish --dry-run --access public --tag rc
+npm publish --dry-run --access public --tag latest
 ```
 
 The release suite covers active/dead branch partitioning, fixed-seed topology transformations, strict pointer failures, dual model-pack budgets, complete structured token accounting, multilingual semantic ledgers and thinking, handoffs, request/claim digests, mandatory support excerpts, tool pairs, repeated compression, checkpoint policies, transaction races and committed-report states, exact byte repair, BOM/CRLF, npm tarball allowlisting and offline tarball installation.
 
-### Maintainer RC Release Checklist
+### Maintainer Stable Release Checklist
 
-1. Confirm a clean public tree and matching `1.0.0-rc.1` values in `package.json`, Python version output, docs, and tests.
+1. Confirm a clean public tree and matching `1.0.0` values in `package.json`, Python version output, docs, and tests.
 2. Run the Python, npm, isolated-Python, tarball, privacy, and offline-install gates above.
 3. Inspect `npm pack --dry-run --json`; publish only the allowlisted files.
-4. Require a clean worktree, create annotated tag `v1.0.0-rc.1`, and push the commit and tag.
-5. For the first manual RC, publish from an authenticated maintainer machine with npm 2FA:
+4. Require a clean worktree, create annotated tag `v1.0.0`, and push the commit and tag.
+5. Publish from an authenticated maintainer environment with permission to publish this package:
 
 ```bash
-npm publish --access public --tag rc
+npm publish --access public --tag latest
 ```
 
-6. Verify the npm version and `rc` dist-tag, then create the GitHub prerelease from the already-pushed tag.
+6. Verify npm version `1.0.0` and the `latest` dist-tag, then create a GitHub release (not a prerelease) from the already-pushed tag.
 
 Do not append `--provenance` to a local publish. npm provenance requires a supported cloud CI runner. For later releases, prefer npm trusted publishing from a public GitHub repository on a GitHub-hosted runner with `id-token: write`, a protected release tag, and a matching protected environment; trusted publishing generates provenance automatically.
 

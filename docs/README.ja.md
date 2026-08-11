@@ -1,14 +1,10 @@
-<p align="center">
-  <a href="../README.md"><img alt="English" src="https://img.shields.io/badge/English-6b7280?style=for-the-badge"></a>
-  <a href="README.zh-CN.md"><img alt="简体中文" src="https://img.shields.io/badge/%E7%AE%80%E4%BD%93%E4%B8%AD%E6%96%87-6b7280?style=for-the-badge"></a>
-  <a href="README.ja.md"><img alt="日本語" src="https://img.shields.io/badge/%E6%97%A5%E6%9C%AC%E8%AA%9E-2563eb?style=for-the-badge"></a>
-</p>
-
 # Claude JSONL Compressor
+
+[English](../README.md) | [简体中文](README.zh-CN.md) | [日本語](README.ja.md)
 
 Claude Code のセッショントランスクリプト 1 件に対する厳格なモデル支援型の圧縮と、過去の `Read.pages` レコードを対象とした、バイト列を保持する独立した互換性修復を提供します。
 
-**リリース：** [`1.0.0-rc.1`](../CHANGELOG.md)<br>
+**リリース：** [`1.0.0`](../CHANGELOG.md)<br>
 **エンジン：** `v10`<br>
 **モデルパック schema：** `v11`<br>
 **ライセンス：** GPL-3.0-only<br>
@@ -153,10 +149,10 @@ Remove-Item -LiteralPath $skill -Recurse -Force
 
 ### npm CLI のインストール
 
-RC が公開された後：
+バージョン 1.0.0 の正式版が公開された後：
 
 ```bash
-npm install --global @brandry/claude-jsonl-compressor@rc
+npm install --global @brandry/claude-jsonl-compressor
 ```
 
 これにより 2 つのコマンドがインストールされます。
@@ -171,7 +167,7 @@ npm パッケージは、同梱の Python 実装に対する依存関係ゼロ�
 グローバル CLI のアップグレードまたはアンインストール：
 
 ```bash
-npm install --global @brandry/claude-jsonl-compressor@rc
+npm install --global @brandry/claude-jsonl-compressor
 npm update --global @brandry/claude-jsonl-compressor
 npm uninstall --global @brandry/claude-jsonl-compressor
 ```
@@ -179,7 +175,7 @@ npm uninstall --global @brandry/claude-jsonl-compressor
 ローカル開発向けのインストールと実行：
 
 ```bash
-npm install --save-dev @brandry/claude-jsonl-compressor@rc
+npm install --save-dev @brandry/claude-jsonl-compressor
 npm update @brandry/claude-jsonl-compressor
 npm exec -- claude-jsonl-compressor --version
 npm exec -- claude-jsonl-repair-read-pages --version
@@ -189,15 +185,15 @@ npm uninstall @brandry/claude-jsonl-compressor
 インストールを残さずに実行：
 
 ```bash
-npx --yes --package @brandry/claude-jsonl-compressor@rc claude-jsonl-compressor --version
-npx --yes --package @brandry/claude-jsonl-compressor@rc claude-jsonl-repair-read-pages --version
+npx --yes --package @brandry/claude-jsonl-compressor claude-jsonl-compressor --version
+npx --yes --package @brandry/claude-jsonl-compressor claude-jsonl-repair-read-pages --version
 ```
 
 実際の npm/npx 操作でも、同じ Python CLI オプションを使用します。
 
 ```bash
-npx --yes --package @brandry/claude-jsonl-compressor@rc claude-jsonl-compressor --input session.jsonl --write-model-pack run/session.model-pack.md
-npx --yes --package @brandry/claude-jsonl-compressor@rc claude-jsonl-repair-read-pages --input session.jsonl --scan-only
+npx --yes --package @brandry/claude-jsonl-compressor claude-jsonl-compressor --input session.jsonl --write-model-pack run/session.model-pack.md
+npx --yes --package @brandry/claude-jsonl-compressor claude-jsonl-repair-read-pages --input session.jsonl --scan-only
 ```
 
 ### インストールせずにソースから使う
@@ -562,24 +558,24 @@ python -B -I -S scripts/compress_claude_jsonl.py --version
 python -B -I -S scripts/repair_claude_jsonl.py --version
 npm test
 npm pack --dry-run --json
-npm publish --dry-run --access public --tag rc
+npm publish --dry-run --access public --tag latest
 ```
 
 リリーススイートは、active／不要ブランチの分割、固定シードによるトポロジー変換、厳格なポインタ失敗、2 系統のモデルパック予算、完全な構造化トークン計上、多言語の意味的な記録と thinking、ハンドオフ、リクエスト／主張のダイジェスト、必須の裏付け抜粋、ツールのペア、繰り返しの圧縮、チェックポイントポリシー、トランザクションの競合とコミット済みレポート状態、厳密なバイト単位の修復、BOM／CRLF、npm tarball の許可リスト、オフラインでの tarball インストールを対象とします。
 
-### メンテナー向け RC リリースチェックリスト
+### メンテナー向け正式リリースチェックリスト
 
-1. 公開ツリーがクリーンであること、および `package.json`、Python のバージョン出力、ドキュメント、テストにおける `1.0.0-rc.1` の値が一致していることを確認する。
+1. 公開ツリーがクリーンであること、および `package.json`、Python のバージョン出力、ドキュメント、テストにおける `1.0.0` の値が一致していることを確認する。
 2. 上記の Python、npm、隔離 Python、tarball、プライバシー、オフラインインストールの各ゲートを実行する。
 3. `npm pack --dry-run --json` を確認し、許可リストに載っているファイルのみを公開する。
-4. ワークツリーがクリーンであることを要求し、注釈付きタグ `v1.0.0-rc.1` を作成して、コミットとタグをプッシュする。
-5. 最初の手動 RC は、npm の 2 要素認証を有効にした認証済みのメンテナーのマシンから公開する。
+4. ワークツリーがクリーンであることを要求し、注釈付きタグ `v1.0.0` を作成して、コミットとタグをプッシュする。
+5. このパッケージを公開する権限を持つ、認証済みメンテナー環境から公開する。
 
 ```bash
-npm publish --access public --tag rc
+npm publish --access public --tag latest
 ```
 
-6. npm のバージョンと `rc` dist-tag を確認したうえで、既にプッシュ済みのタグから GitHub のプレリリースを作成する。
+6. npm のバージョン `1.0.0` と `latest` dist-tag を確認したうえで、既にプッシュ済みのタグから GitHub の正式リリース（prerelease ではない）を作成する。
 
 ローカルでの公開コマンドに `--provenance` を付けないでください。npm の provenance には、サポートされたクラウド CI ランナーが必要です。以降のリリースでは、公開 GitHub リポジトリから、GitHub ホストのランナー上で `id-token: write`、保護されたリリースタグ、対応する保護環境を用いた npm trusted publishing を推奨します。trusted publishing では provenance が自動生成されます。
 

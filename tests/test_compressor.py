@@ -82,7 +82,7 @@ class TestBasicCompression(CompressBase):
         self.assertEqual(v["tool_pair_error_count"], 0)
         self.assertEqual(v["compact_boundary_count"], 1)
         self.assertEqual(v["compact_summary_count"], 1)
-        self.assertEqual(report["package_version"], "1.0.0-rc.1")
+        self.assertEqual(report["package_version"], "1.0.0")
         self.assertEqual(report["codex_offline_compression_version"], "v10")
         self.assertEqual(report["model_pack_schema_version"], 11)
         self.assertEqual(report["report_schema_version"], 1)

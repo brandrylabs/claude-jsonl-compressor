@@ -7,7 +7,7 @@ description: Compress one Claude Code JSONL session with strict active-branch is
 
 Operate on exactly one authoritative JSONL. Never merge another branch or session automatically.
 
-Public package: `1.0.0-rc.1`. Internal engine: `v10`. Model-pack schema: `v11`.
+Public package: `1.0.0`. Internal engine: `v10`. Model-pack schema: `v11`.
 
 ## Safety Invariants
 

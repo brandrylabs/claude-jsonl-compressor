@@ -1,7 +1,7 @@
 # Claude Code JSONL Compression Format Notes
 
 This document describes the empirical format handled by
-`@brandry/claude-jsonl-compressor` package `1.0.0-rc.1` and engine `v10`.
+`@brandry/claude-jsonl-compressor` package `1.0.0` and engine `v10`.
 
 Claude Code transcript JSONL is an observed internal format, not a published
 stable storage API. The rules below are deliberately strict where ambiguity
@@ -14,7 +14,7 @@ The project keeps four independent version domains:
 
 | Domain | Current value | Meaning |
 | --- | --- | --- |
-| Package | `1.0.0-rc.1` | GitHub/npm release version |
+| Package | `1.0.0` | GitHub/npm release version |
 | Compression engine | `v10` | Topology, partition, and rewrite behavior |
 | Model-pack schema | `v11` | Evidence-pack and model-summary binding protocol |
 | Report schema | `1` | Compression and repair report fields |

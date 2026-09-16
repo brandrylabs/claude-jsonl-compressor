@@ -1,7 +1,7 @@
 # Claude Code JSONL Compression Format Notes
 
 This document describes the empirical format handled by
-`@brandry/claude-jsonl-compressor` package `1.0.0` and engine `v10`.
+`@brandry/claude-jsonl-compressor` package `1.1.0` and engine `v10`.
 
 Claude Code transcript JSONL is an observed internal format, not a published
 stable storage API. The rules below are deliberately strict where ambiguity
@@ -14,7 +14,7 @@ The project keeps four independent version domains:
 
 | Domain | Current value | Meaning |
 | --- | --- | --- |
-| Package | `1.0.0` | GitHub/npm release version |
+| Package | `1.1.0` | GitHub/npm release version |
 | Compression engine | `v10` | Topology, partition, and rewrite behavior |
 | Model-pack schema | `v11` | Evidence-pack and model-summary binding protocol |
 | Report schema | `1` | Compression and repair report fields |
@@ -576,3 +576,60 @@ Passing these checks proves coherence under this project's empirical rules. It
 does not make the private transcript format an Anthropic-supported public API.
 When runtime testing is explicitly requested, `/resume`, `/context`, recent
 conversation rewind, and recent file rewind are separate observations.
+
+## Package 1.1.0 additive controls
+
+CLI defaults remain `tool_evidence=excerpt`, `citation_style=legacy`,
+`prior_summary_overflow=fold`, `min_recent_turns=0`. Non-default values add
+`toolEvidence`, `citationStyle`, `priorSummaryOverflow`, `minRecentTurns` to the
+v11 request manifest; defaults omit these keys. This preserves the old manifest
+shape, not cross-version evidence bytes: regenerate packs after upgrading.
+
+Full tool evidence uses the existing per-record full_text_json/claim-source
+contract. It is a labelled field ledger with complete tool inputs, API results,
+auxiliary toolUseResult and source assistant identity. An exact_string_alias_of
+line refers only to an identical string of at least 80 characters earlier in
+that record. It never deduplicates by path, meaning, or another branch. All
+complete-tool records are mandatory and may not be sampled to fit. Warning
+characters are retained. Plain injected/unknown user-format prose remains
+mandatory too; it is not attributed to a human. Neither full evidence nor
+source excerpts establish that a model interpreted a fact correctly.
+
+Scoped prose references are exactly [@L42] / [@H3]. Coverage entries keep the
+printed L prefix; support_text_json contents are excluded from reference scans.
+The chosen style is bound in both passes. Historical source statements about
+unavailable information are allowed; grounding checks still apply.
+
+Strict prior-summary overflow uses the existing 1.5x summary character limit.
+Preflight and pack generation reject when the preserved old block and even an
+empty new layer cannot fit. Actual new-layer size is checked in pass 2. Exact
+preserved spans include trailing whitespace and carry SHA-256 and ordered
+offsets. The legacy fold policy still reports fallback-folded on overflow.
+
+Recent-turn protection only considers human-started records after the latest
+compact and within the final session. Tool-boundary adjustment must not cross
+that floor. A positive setting is rejected in physical-tail mode. Reports
+count structural human messages and snapshots, not actual rewind menu points.
+
+Title selection is shared by locator and compressor: last valid custom title
+in the final session, otherwise last valid automatic title. Supported fields
+are customTitle/aiTitle, title, then message.content. Only UUID-less, parent-less
+control records may be projected; an unowned title is attributable only when
+the source has one nonempty session ID. A rename after the pointer is control
+metadata, not conversation evidence. Selected metadata retains unknown fields
+and is assigned the output session ID. Prior title projections are removed,
+and the final title is written before the sole final last-prompt. Ambiguous
+unowned titles are counted, never used to override a known owner.
+
+Preflight is read-only. Its topology, activeChain, partition, estimates and pack
+fields separate structural validity, selected-source validation and capacity.
+Physical-tail diagnostics are not a recovery authorization. It may return
+nothing-to-summarize without building a pack. Exact source bytes are hashed;
+freeze a numbered backup after successful preflight and compare hashes before
+model work. Candidate and live replacement retain their existing write rules.
+
+Cost discipline: one authoring pass and focused self-review by default; use
+additional review when requested or needed to resolve a concrete conflict.
+Honor requested reviewer model/effort/scope, and pass only complete relevant
+evidence from the selected branch. No automatic fan-out, budget escalation,
+external document retrieval, or multi-volume pipeline is part of this package.

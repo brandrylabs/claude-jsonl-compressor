@@ -58,6 +58,13 @@ exercise standalone entry points. Release verification also runs CLI smoke tests
 
 ## Required Behavioral Gates
 
+Package 1.1.0 adds anonymous protocol checks for complete tool payloads and
+exact aliases, scoped citations, strict old-summary overflow/whitespace,
+read-only preflight capacity/closure/no-old-region states, human-turn protection,
+final-session title projection and three successive exact-preservation rounds.
+Fixed authored summaries exercise transport and source contracts, not model
+quality or actual Claude `/rewind` compatibility. No Claude CLI is invoked.
+
 ### Resume topology and rewind isolation
 
 - The physically last `last-prompt` is authoritative; malformed latest

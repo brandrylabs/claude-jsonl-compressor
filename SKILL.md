@@ -1,345 +1,230 @@
 ---
 name: claude-jsonl-compressor
-description: Compress one Claude Code JSONL session with strict active-branch isolation, model-authored semantic summaries by default, recent raw context for rewind, validated compact-style output, transactional backup/replacement for one live .claude/projects file, and an independent byte-preserving Read.pages compatibility repair. Use for compressing, shrinking, summarizing, preflighting, replacing, or repairing Claude CLI/Claude Code JSONL transcripts.
+description: Compress one Claude Code JSONL using a source-anchored model summary, strict active-branch isolation and recent raw context, or explicitly repair historical Read.pages compatibility. Supports candidate output and transactional replacement of one closed live session.
 ---
 
 # Claude JSONL Compressor
 
-Operate on exactly one authoritative JSONL. Never merge another branch or session automatically.
+Package **1.1.0**, engine **v10**, model-pack **v11**, report **1**.
 
-Public package: `1.0.0`. Internal engine: `v10`. Model-pack schema: `v11`.
+Reduce Claude context/cache costs while preserving the user's required history.
+Operate on exactly one authoritative JSONL. Never merge sessions or revive
+rewound branches. Python uses only the standard library and calls no model or
+network; Codex authors the semantic summary between two deterministic passes.
+Do not install tokenizers, PyYAML or other packages. Do not run Claude CLI unless
+the user explicitly requests it.
 
-## Safety Invariants
+## Choose the operation and unique source
 
-1. Model-assisted semantic summary generation is the default. Use deterministic summary only when the user explicitly requests fallback.
-2. Determine the active branch from structure before reading text for semantic importance.
-3. The physically last `type: "last-prompt"` record is the automatic authority. Do not skip a malformed latest pointer to revive an older one.
-4. Rewound/inactive branch text must not enter the model pack, model summary, deterministic appendix, prior-summary verbatim block, recent raw records, side records, or output API-message chain.
-5. Only the active-chain old segment may be summarized. The model cannot select a leaf, change the partition, or restore excluded records.
-6. Preserve the recent active suffix byte-for-field except for the single parent edge that connects its first record to the new compact summary and optional explicit `sessionId` normalization.
-7. Preserve unknown fields on retained records. Project the authoritative `last-prompt` object and retain its unknown fields; output exactly one final pointer.
-8. Never install `tiktoken`, `regex`, PyYAML, or another package for this workflow. Runtime code uses the Python standard library.
-9. Never write process files inside `.claude`. A live replacement may leave only the requested JSONL and its numbered backup beside it.
-10. Do not run Claude CLI for validation unless the user explicitly asks. Structural validation is mandatory regardless.
-11. Do not put project-specific facts, paths, identifiers, or prior-session content into this skill.
-12. Treat the model summary as model-authored and source-anchored, not model-validated truth. Require v11 request binding and one exact source excerpt per mandatory semantic/prior-summary record.
+- Prefer exact path, filename or session ID. For an explicitly requested title
+  lookup, run `scripts/claude_session_tools.py --root ROOT --query TITLE --scan-titles`.
+  Without title scanning the helper reads no transcript bodies. Exact ID/path
+  matches take precedence; multiple matches stop. It uses the latest attributable
+  custom title, falling back to automatic title. Old names are not aliases.
+- **Candidate:** distinct input/output paths; source stays unchanged. Output,
+  report and validation live outside the entire `.claude` tree.
+- **Live replacement:** user requests in-place compression of one existing
+  `.claude/projects/PROJECT/SESSION.jsonl` (including identical input/output).
+  Use input only, `--replace-original --confirm-session-closed --work-dir WORK`.
+  WORK and all process files must be outside `.claude`. Closed-session
+  acknowledgement is a caller assertion, not lock detection. Use the original
+  filename stem as session ID unless another is explicitly requested.
+- **Read.pages repair:** a separate, explicitly requested operation; never run
+  it implicitly as part of compression. See the repair section below.
 
-## Resolve The Operation First
-
-### Candidate Mode
-
-Use when the user provides distinct input and output paths.
-
-- Do not modify the input.
-- Write the candidate to the requested output.
-- Write `<output>.report.md` and `<output>.validation.json` beside it.
-- Refuse identical input/output paths.
-- Refuse a direct output under `.claude/projects`; use live replacement mode there.
-
-### Live Replacement Mode
-
-Use when the user explicitly asks to compress one existing `.claude/projects/<project>/<session>.jsonl` in place, including prompts that give the same path as input and output.
-
-- Treat the path as `--input`; do not pass `--output`.
-- Require an existing regular `.jsonl` target under `.claude/projects`; use `--replace-original`, `--confirm-session-closed`, and a work directory outside the entire `.claude` tree. The flag records caller acknowledgement; it does not detect a process lock.
-- The script creates `<session>.jsonl.backup`, then `.backup1`, `.backup2`, and so on with exclusive creation.
-- Candidate, model pack, model summary, validation and report files stay under `--work-dir`.
-- The filename stem remains the target session ID unless the user explicitly supplies another one.
-- Replacement occurs only after candidate validation and a full-byte SHA-256 source recheck.
-- A failed post-replacement validation restores the original bytes and returns an error.
-
-### Read.pages Compatibility Repair
-
-This is a separate operation. Do not invoke it implicitly during compression.
-
-- It removes only the exact `pages` member from structured assistant `tool_use` blocks whose name is exactly `Read`, whose `input.file_path` exists, and whose tool ID has a matching `tool_result` in the selected scope.
-- Default scope is the strict active chain. `--scope all` is explicit.
-- Pending calls are reported and left unchanged.
-- All bytes outside the planned JSON-member deletion spans remain identical, including BOM, CRLF/LF, escaping, Unicode and unknown fields.
-
-## Mandatory Preflight
-
-Resolve the skill root without hardcoding a user's machine:
+Resolve the skill directory from the environment, for example:
 
 ```powershell
 $skill = "$env:USERPROFILE\.codex\skills\claude-jsonl-compressor"
 ```
 
-Analyze the authoritative resume path before making a model pack or candidate:
+## Preflight and choose affordable evidence
+
+Run `--preflight` before reading the source for semantic importance, using the
+same selection settings intended for both passes. `--analyze-resume-path` remains
+available as the smaller topology-only diagnostic.
 
 ```powershell
 python "$skill\scripts\compress_claude_jsonl.py" `
-  --input "C:\path\session.jsonl" `
-  --analyze-resume-path
+  --input "C:\data\session.jsonl" --preflight `
+  --target-ratio 0.30 --min-recent-records 120 `
+  --summary-char-budget 60000 --target-estimated-tokens 150000 `
+  --tool-evidence full --citation-style scoped
 ```
 
-Use `reasonCode` as the exact machine-readable outcome and `status` only as its
-coarse category. The stable pairs are documented in
-`references/claude-jsonl-compression-format.md`.
+Choose settings deliberately:
 
-Strict active mode stops before writing any pack, candidate, sidecar or backup when the authority is absent, malformed, dangling, cyclic, has unsafe/recurring session lineage, has ordinary-message physical parent inversion, contains a malformed `parentUuid`, or is UUID-ambiguous.
+- `--tool-evidence full` when document/research evidence lives in tool inputs or
+  results, or the user requires fine preservation of those contents. It includes
+  complete old active tool payloads, mixed text/tool records and auxiliary
+  results. Exact repeated long strings within one record use a visible alias;
+  different previews/results remain distinct. U+FFFD produces a warning, not
+  deletion of a complete record. Paths alone are not external file contents.
+- CLI default `excerpt` is suitable when selected short tool evidence suffices;
+  it is not a full-payload fidelity guarantee. Do not silently downgrade a
+  research preservation requirement just to fit a budget.
+- Use `--citation-style scoped` for new summaries, avoiding source labels like
+  L73/H1 being interpreted as citations. Legacy syntax remains a CLI option.
+- To protect whole recent human-started turns, add `--min-recent-turns N`.
+  Only the final session after its latest compact is eligible. This may enlarge
+  raw context or leave nothing to summarize; never reduce a requested window
+  silently. Report actual human messages/snapshots, not promised rewind points.
+- When the user requires existing summaries unchanged, use both
+  `--preserve-prior-summaries-verbatim --prior-summary-overflow error` in both
+  passes. This preserves exact old content including trailing whitespace and
+  appends a new layer inside one current compact summary. It stops on overflow.
+  The legacy default `fold` permits reported fallback-folded; do not use it for
+  an absolute no-rewrite request.
 
-After partitioning, run the shared validator on the authoritative logical active chain plus its projected pointer. Old malformed tool exchanges, duplicate tool IDs, or compact-pair metadata on that chain must stop before semantic evidence generation; damage confined to excluded inactive branches remains excluded and does not become summary text.
+Preflight separates topology, selected-chain tool/compact validity, partition
+and pack capacity. `nothing-to-summarize` needs no model work. A physical-tail
+candidate and `end_turn` are diagnostics, not automatic authority. The latest
+physical `last-prompt` remains authoritative even if malformed; reasonCode is
+the machine-readable cause and status its coarse category. A selected chain
+ending in tool_use may have a result later in the file; do not call the source
+damaged solely because that selected window is incomplete.
 
-When strict preflight reports an unusual or ambiguous topology, stop with zero writes and explain the structural status without copying excluded transcript text. Ask the user to confirm a specific recovery control only when one is applicable. Do not infer confirmation from the original compression request, and never retry automatically in compatibility mode. The Python CLI remains non-interactive.
+The pack ceilings remain **500,000 characters / 150,000 local estimated tokens**.
+The settings are `--model-pack-char-budget` and `--model-pack-estimated-token-budget`.
+Full mandatory evidence that cannot fit stops before pack publication. Do not
+automatically split into volumes, increase ceilings, invoke extra models or
+repeatedly reread full history. Report the capacity boundary and available
+choices. An explicit user request can authorize a larger budget or review
+workflow within the model's capacity. `--target-estimated-tokens` gates candidate
+Messages under a separate complete-structure local estimate; it does not predict
+Claude `/context` total. `--target-ratio` is approximate byte planning only.
 
-Recovery controls:
+After successful preflight, freeze a numbered source backup before semantic
+work and compare its SHA-256 with preflight. The locator's `--backup` creates
+`.jsonl.backup`, `.backup1`, etc.; for an exact standalone file, its Python
+`create_backup(Path(...))` helper has the same verified exclusive behavior.
+An already supplied independent backup may serve for a candidate-only request
+if its bytes/hash are verified. If the source changed, repeat preflight. Live
+replacement still creates its own verified transaction backup before modifying
+the live target; do not bypass it with a manual copy.
 
-- Use `--resume-leaf UUID` only when the user explicitly identifies the desired leaf. The report marks `manualOverride: true` and labels the mode `active-chain-manual-override`, not default strict `active-chain`.
-- Use `--preserve-physical-tail` only when the user explicitly requests compatibility behavior. It does not provide inactive-branch exclusion guarantees.
-- Default post-pointer extension is zero. Use `--max-post-last-prompt-extension N` only for a physically post-pointer, direct, same-session, tool-result-only closure of every pending tool ID. Ordinary user/assistant conversation, system/hook records, partial closure and unrelated results are rejected.
+## Two-pass model workflow
 
-Observed-format compatibility remains narrow and deterministic:
+Generate a pack outside `.claude`. Replace `--preflight` in the chosen command
+with `--write-model-pack "C:\work\run\session.model-pack.md"`. Keep every
+selection option identical in pass 2, including tool evidence, citation style,
+turn count, prior-summary policy, candidate/pack budgets, checkpoint policy,
+manual leaf, handoff and custom resource files. Require summary budget >=4000.
 
-- An acyclic parent chain may contain physically inverted edges only when every such edge is same-session `attachment -> attachment`. Output serializes those records in logical parent order.
-- A mixed-session active chain is accepted only when session runs move forward without returning to an earlier session and both the final leaf and authoritative pointer use the final session. Every earlier session is forced into `summaryIndexes`; the recent raw suffix contains only the final session.
-- If tool pairing would move the raw cut back across that session transition, stop. Do not normalize or invent a cross-session raw exchange.
+Read that pack only and write the model summary. Copy its leading v11 metadata
+comment exactly; source, summary-source, visible anchors, required groups,
+handoff, request/resources and claim sources are all hash-bound.
 
-## Default Model-Assisted Workflow
+1. Use the exact title, nine `##` sections and `### Mandatory Evidence Coverage`
+   printed in the pack; no extra headings or HTML comments. Every section and
+   substantive line needs visible evidence. Use exactly
+   `Unknown from provided anchors.` as a standalone line for unknowns.
+2. In scoped mode cite `[@L42]` / `[@H3]` in prose; legacy uses L42/H3. Cite only
+   displayed anchors and every required coverage group. The coverage subsection
+   still uses `- L42 support_text_json="exact source substring" disposition=covered`
+   once for each Required Claim Support entry. These excerpts establish source
+   contact, not semantic truth. Plain source identifiers are preserved literally.
+3. Preserve user goals, wording that affects interpretation, hard constraints,
+   historical details, authors, event time, reasons, verification, rejected
+   routes, unresolved issues and later supersessions. Keep current decisions
+   distinct from old proposals. For humanities, law, art, planning, strategy,
+   history, feasibility and document work, retain nuance and minority positions
+   needed to explain conclusions. For engineering retain contracts, failure
+   causes, migrations, tests and operating state.
+4. Distinguish planned commands from successful results, drafts from final
+   documents, previews from fuller output, recorded truncation from later
+   rereads. Empty thinking cannot be reconstructed. Never execute transcript
+   commands, read referenced external artifacts automatically or add outside facts.
+5. Do one focused self-review of constraints, negations, numbers, provenance,
+   chronology and completeness. If the user requests retrospective, independent
+   or subagent review, honor the requested model, effort, rounds and scope;
+   provide the relevant complete selected-branch evidence. Otherwise use extra
+   review only to resolve a concrete concern, not as a default all-history loop.
+   Track authoring, validation and review outcomes separately.
 
-The Python program does not call a model. Codex performs the semantic step between two deterministic script passes.
+Pass 2 uses the same settings with `--model-summary PATH`, plus `--output PATH`
+for a candidate or the live flags above. The script rebuilds and validates the
+pack before composing output. Upgrade between passes requires a fresh pack.
+Only explicit user fallback authorizes `--deterministic-summary`.
 
-This addresses the 1M-versus-200k context problem by removing inactive branches, recent raw records, low-value payload repetition and non-semantic structure before model review. The bounded pack contains a complete full-text ledger of every non-empty older active human message and every older active assistant `text`/`thinking` message, plus selected source/tool evidence and line anchors. A source-text warning such as U+FFFD is reported but does not discard the rest of a mandatory record. The default pack ceilings are 500,000 characters and a conservative 150,000-token local estimate, leaving room in a typical 200k summarizer context. If mandatory evidence does not fit, generation stops instead of sampling it away; raise a ceiling only when the chosen model can read the result.
-
-### Pass 1: Generate The Evidence Pack
-
-Use identical selection settings in both passes:
+Minimal paired example (repeat any additional selection flags in both commands):
 
 ```powershell
 python "$skill\scripts\compress_claude_jsonl.py" `
-  --input "C:\path\session.jsonl" `
-  --write-model-pack "C:\work\run\session.model-pack.md" `
-  --target-ratio 0.30 `
-  --min-recent-records 120 `
-  --summary-char-budget 60000 `
-  --target-estimated-tokens 150000 `
-  --model-pack-char-budget 500000 `
-  --model-pack-estimated-token-budget 150000
+  --input "C:\data\session.jsonl" --write-model-pack "C:\work\run\pack.md" `
+  --target-estimated-tokens 150000 --citation-style scoped
 ```
 
-The two pack ceilings apply together. Complete human/assistant semantic records,
-prior summaries, handoff lines and required groups are mandatory. Optional
-source/tool/system/error evidence stops at either ceiling and reports
-`evidence_truncated`. Never install a tokenizer for this workflow.
-
-When the user gives an approximate compressed Messages-token ceiling, pass it directly instead of inventing a tokenizer workflow:
-
-```powershell
-  --target-estimated-tokens 150000
-```
-
-This candidate-output gate is distinct from `--model-pack-estimated-token-budget`.
-It is the built-in zero-dependency estimate for transcript Messages only. It
-covers complete retained structured message payloads, including thinking,
-`tool_use.input`, `tool_result`, and `toolUseResult`. It excludes the system
-prompt, tool schemas, MCP, agents, skills, memory files and runtime additions.
-Never claim it predicts Claude `/context` total exactly. Treat `--target-ratio`
-only as approximate byte planning; only an explicit
-`--target-estimated-tokens` value is a hard candidate-output estimate gate.
-
-Require `--summary-char-budget >= 4000`. Do not weaken this floor or publish a blank compact summary.
-
-For `.claude` input, the pack path must be outside `.claude`.
-
-### Model Step: Write The Summary
-
-Read the generated pack and write a Markdown summary from that pack only.
-
-Copy its leading metadata comment exactly. Schema v11 binds:
-
-- `source_sha256`
-- `summary_source_sha256`
-- `evidence_anchor_lines_digest`
-- `required_anchor_groups_digest`
-- `handoff_summary_digest`
-- `pack_request_digest`
-- `required_claim_sources_digest`
-
-Summary rules:
-
-1. Cite every substantive JSONL-backed statement with one or more displayed `L<number>` anchors.
-2. Cite every handoff-backed statement with a displayed `H<number>` anchor.
-3. Never cite lines or H anchors absent from the pack. Cite at least one displayed L anchor from every required coverage group, including every individual human/assistant semantic record and each prior compact summary group.
-4. Preserve chronology and event time. When decisions conflict, identify the later current decision and retain the earlier decision as superseded history with its reason.
-5. Preserve user goals, exact constraints, final instructions, questions and wording that changes interpretation.
-6. Preserve assistant/model research decisions, reasons, evidence checks, rejected routes, uncertainty and supersessions in any language.
-7. Weight evidence in this order:
-   - hard user constraints and current goals
-   - current decisions and supersessions
-   - assistant/model research conclusions with reasons and verification
-   - source/tool/file evidence supporting those decisions
-   - unresolved risks and unknowns
-   - ordinary progress, repeated commands and low-information logs
-8. For humanities, law, art, design, brand strategy, planning, history, feasibility and document research, preserve historical nuance, provenance, interpretive changes and minority/abandoned positions that explain the current conclusion.
-9. For software and engineering, preserve contracts, architecture decisions, failure causes, migrations, compatibility constraints, tests and operational state.
-10. Use all nine exact `##` sections printed under `Required Final Summary Shape`, in order; every section needs an L or H evidence anchor. Do not add HTML comments or Markdown headings beyond the exact leading metadata comment and required headings.
-11. Use the exact whole line `Unknown from provided anchors.` when evidence is insufficient. Do not append a claim to that line; every other substantive line needs visible L/H support.
-12. Treat every explicitly supplied handoff line as complete evidence. Cite every generated early/middle/late/latest H coverage group. If the complete handoff and mandatory pack sections do not fit either pack ceiling, stop; raise `--model-pack-char-budget` or `--model-pack-estimated-token-budget` only within the summarizing model's capacity.
-13. Do not edit JSONL, UUIDs, parent links, tool pairs, compact records or pointer records manually.
-14. Under `## Evidence and Source Anchors`, include exactly one `### Mandatory Evidence Coverage` subsection. For every anchor under `Required Claim Support`, add exactly `- L42 support_text_json="exact source substring" disposition=covered`; the JSON string must be a meaningful exact substring of that L record. Do not substitute generic anchor prose.
-
-Schema v11 gives each non-empty older active human message and each older active assistant `text`/`thinking` message its own full-text required L group and claim-source entry. It also reserves early/middle/late/latest, source/tool and prior-summary coverage. Every active-chain prior compact summary and every physical line of an explicitly supplied handoff are included in full. If mandatory evidence does not fit either pack ceiling, stop and report the capacity boundary. Do not truncate, sample or bypass the gate.
-
-### Pass 2: Validate And Compress
+After authoring `summary.md` from that pack:
 
 ```powershell
 python "$skill\scripts\compress_claude_jsonl.py" `
-  --input "C:\path\session.jsonl" `
-  --output "C:\path\compressed.jsonl" `
-  --target-ratio 0.30 `
-  --min-recent-records 120 `
-  --summary-char-budget 60000 `
-  --target-estimated-tokens 150000 `
-  --model-pack-char-budget 500000 `
-  --model-pack-estimated-token-budget 150000 `
-  --model-summary "C:\work\run\session.model-summary.md"
+  --input "C:\data\session.jsonl" --output "C:\work\run\candidate.jsonl" `
+  --model-summary "C:\work\run\summary.md" `
+  --target-estimated-tokens 150000 --citation-style scoped
 ```
 
-Repeat every non-default pass-1 option in pass 2, including candidate token target, checkpoint policy, explicit leaf, handoff file, both model-pack budgets, templates and prior-summary policy. The v11 `pack_request_digest` binds those options and loaded resources; the script rejects a summary whose request, source, evidence, claim-source hashes or anchors do not match the regenerated pack.
+## Structural boundaries and recovery
 
-Use this only on explicit request for deterministic fallback:
+- Strict failures are zero-write: no pack, candidate, sidecar or backup. Do not
+  retry automatically in compatibility mode. A diagnosed recovery control needs
+  explicit user authorization; a compression request alone does not select it.
+  `--resume-leaf UUID` requires an explicitly identified leaf;
+  `--preserve-physical-tail` forfeits branch/rewind isolation and cannot use
+  positive `--min-recent-turns`.
+- `--max-post-last-prompt-extension N` permits only a direct, same-session,
+  physically later tool-result-only closure of all pending calls. Ordinary
+  conversation, control records, branches and partial closure are rejected.
+- Same-session attachment-only physical inversions can be serialized in logical
+  order. One-way mixed-session lineage can summarize earlier sessions while
+  retaining only the final session raw; tool pairs cannot cross that boundary.
+- No inactive/rewound text may enter any evidence, prior-summary block, appendix,
+  raw history, side record or API chain. Older preservedMessages is historical;
+  rewind divergence warns without reviving the old tail. New compact metadata
+  must match the candidate chain, with exactly one current compact pair/pointer.
+- Preserve unknown raw fields; only the first retained parent edge and explicit
+  session-ID normalization may change. Final attributable title metadata is
+  projected separately, including later renames, with unknown fields retained.
+- Default checkpoint policy is `active-correlated`; `none` disables snapshots.
+  `preserve-recent` is only physical-tail compatibility. File rewind depends on
+  native snapshots, not JSONL alone; Bash file changes are not checkpointed.
+
+## Read.pages repair
 
 ```powershell
-  --deterministic-summary
+python "$skill\scripts\repair_claude_jsonl.py" --input "C:\data\session.jsonl" --scan-only
 ```
 
-Do not silently choose deterministic fallback because model authoring is inconvenient.
+For a candidate add `--output PATH --expect-matches N`; live uses
+`--replace-original --confirm-session-closed --work-dir WORK --expect-matches N`.
+Default scope is strict active chain; `--scope all` needs explicit intent to
+repair inactive records too. Exact Read tool_use pages deletion requires an
+existing input.file_path member, one later same-session matching result and
+matching sourceToolAssistantUUID. Pending calls stay unchanged. Bytes outside
+planned member spans, UUID/parent/tool IDs, BOM/newlines/escaping remain identical.
 
-## Live Replacement Commands
+## Completion and transaction evidence
 
-Generate the model pack outside `.claude`, write the model summary, then run:
+Compression requires fresh candidate `ok: true`, valid UUID/parent/session/tool
+pairing, one current compact pair and projected pointer, branch counts without
+branch text, exact title projection and any requested token ceiling. Explicit
+ordered-subset tool results are warnings/counts, not silently complete exchanges.
+Candidate mode must leave input unchanged. Repair also requires expected match
+count, exact byte validation, published-byte reread and idempotent second scan.
 
-```powershell
-python "$skill\scripts\compress_claude_jsonl.py" `
-  --input "$env:USERPROFILE\.claude\projects\PROJECT\SESSION.jsonl" `
-  --replace-original `
-  --confirm-session-closed `
-  --work-dir "C:\work\claude-compression\SESSION-TIMESTAMP" `
-  --model-pack-estimated-token-budget 150000 `
-  --target-estimated-tokens 150000 `
-  --model-summary "C:\work\claude-compression\SESSION-TIMESTAMP\session.model-summary.md"
-```
+Live mode additionally requires backup bytes equal original, source hash
+recheck, published bytes/structure validation and correct transaction state.
+Target/explicit backup directories need hard links; capability probes run first.
+Source races, write/fsync/install/validation failures stop; replacement failures
+restore captured original or retain numbered recovery assets and report failure.
+Never overwrite an external claimant. Parent-directory fsync and temporary
+identity cleanup are best effort, not hostile-writer or power-loss guarantees.
+Committed report failure returns **exit 3 / committed-report-failed**; do not
+rerun blindly or call it an uncommitted failure. Keep all process files/reports
+outside `.claude`; only requested JSONL/numbered backups remain in live storage.
 
-By default the backup stays beside the live JSONL. Use an external backup directory only when explicitly requested:
-
-```powershell
-  --backup-dir "C:\work\claude-compression\SESSION-TIMESTAMP\backups"
-```
-
-Do not hand-copy a candidate over a live session after a refusal.
-
-## Checkpoint Policy
-
-Conversation rewind topology and file checkpoints are separate planes.
-
-- `--checkpoint-policy active-correlated` is the default. It keeps only recent UUID-less `file-history-snapshot` records that structurally correlate to retained active records.
-- `--checkpoint-policy none` keeps no UUID-less file-history snapshots.
-- `--checkpoint-policy preserve-recent` is rejected in strict active-chain mode. It is meaningful only with explicit `--preserve-physical-tail`, whose report is labeled `physical-tail-compatibility` and which has no inactive-branch isolation guarantee.
-- `--max-file-history-snapshots N` caps retained snapshots.
-
-Never claim that compressed JSONL alone guarantees complete file-state rewind. The report states what snapshot side records were retained.
-
-## Repeated Compression
-
-Default behavior folds old compact summaries into one current compact summary. The output must contain one current compact pair.
-
-Treat an older `preservedMessages` list as a historical snapshot. A later rewind may make its tail diverge from the current authoritative chain; report that warning, exclude the old tail, and continue only when the current chain itself is valid. Require every newly generated candidate to rebuild the snapshot so it exactly matches the candidate's current chain.
-
-When the user explicitly asks to preserve existing summaries verbatim, repeat this flag in both model-pack and compression passes:
-
-```powershell
-  --preserve-prior-summaries-verbatim
-```
-
-The script may expand the summary character budget to 1.5x. If exact preservation still does not fit, it uses the normal folded path and reports `fallback-folded`. It does not stack old compact pairs into the active chain.
-
-For third and later rounds, apply chronology again. Prior summaries are historical evidence, not automatically current truth. Preserve old decisions and reasons while marking later supersessions.
-
-## Read.pages Repair Commands
-
-Scan without writing:
-
-```powershell
-python "$skill\scripts\repair_claude_jsonl.py" `
-  --input "C:\path\session.jsonl" `
-  --scan-only
-```
-
-Write a separate candidate and require the expected patch count:
-
-```powershell
-python "$skill\scripts\repair_claude_jsonl.py" `
-  --input "C:\path\session.jsonl" `
-  --output "C:\path\session.repaired.jsonl" `
-  --expect-matches 2
-```
-
-Replace one live session transactionally:
-
-```powershell
-python "$skill\scripts\repair_claude_jsonl.py" `
-  --input "$env:USERPROFILE\.claude\projects\PROJECT\SESSION.jsonl" `
-  --replace-original `
-  --confirm-session-closed `
-  --work-dir "C:\work\claude-repair\SESSION-TIMESTAMP" `
-  --expect-matches 2
-```
-
-Use `--scope all` only when the user explicitly wants inactive physical branches repaired too.
-
-An automatic repair additionally requires exactly one later result with the same non-empty `sessionId` and a `sourceToolAssistantUUID` equal to the Read tool-use assistant UUID. Candidate publication must re-read and validate the actual published bytes and prove an idempotent second scan before success.
-
-## Validation And Stop Condition
-
-Before reporting success, require fresh evidence for the selected operation:
-
-Compression:
-
-- candidate validation `ok: true`
-- no duplicate UUID, missing parent, cross-session parent or tool-pair error
-- no empty/duplicate active tool ID; a partial ordered-subset result is accepted only as an explicit compatibility warning and count
-- exactly one current Codex compact boundary/summary pair on the final pointer chain
-- one projected final `last-prompt`
-- dead-branch counts reported without branch text
-- any observed attachment-order/session-lineage compatibility is explicitly reported, and output raw records remain one current-session chain
-- explicit `--target-estimated-tokens` ceiling met under the complete-structure local estimate; an approximate ratio alone is not a hard success claim
-- input unchanged in candidate mode
-- backup bytes equal original bytes in live mode
-- replacement validation `ok: true` in live mode
-
-Repair:
-
-- expected match count satisfied when supplied
-- byte validation `ok: true`
-- UUID/parent and tool-ID signatures unchanged
-- second pass finds zero patchable matches
-- shared full-transcript validation `ok: true`
-- input unchanged in candidate mode
-- numbered backup equals original in live mode
-
-Structural validation alone is an observed-format check, not an Anthropic format guarantee. If the user permits Claude CLI testing, report `/resume`, `/context`, recent conversation rewind and recent file rewind as separate observations.
-
-## Session Location
-
-Prefer an exact path or filename. To locate one session without reading transcript bodies:
-
-```powershell
-python "$skill\scripts\claude_session_tools.py" `
-  --root "$env:USERPROFILE\.claude\projects" `
-  --query "SESSION.jsonl"
-```
-
-Use `--scan-titles` only when the user supplies a title and permits title scanning. Multiple matches are an error. Never broaden a single-target run into directory-wide compression.
-
-## Failure Rules
-
-- A strict topology failure produces no pack, candidate, sidecar or backup.
-- For a special or ambiguous topology, report the strict failure and pause. Offer only the exact explicit control that matches the diagnosis, state the lost guarantee, and require a new user confirmation before running it. Manual/spliced files generally require `--preserve-physical-tail`, which forfeits inactive-branch and rewind isolation.
-- A model-summary validation failure requires regenerating the pack/summary with identical settings; do not weaken validation.
-- A tool-pair failure requires moving the cut earlier or diagnosing source inconsistency; do not invent tool results.
-- A source hash change aborts live replacement.
-- Live replacement requires the Claude process for that session to be closed. The transaction validates immutable candidate bytes, exclusively creates and verifies a numbered backup, captures the actual old target, verifies its full SHA-256, installs the candidate, and verifies the published bytes and structure. If another process recreates the target during capture, preserve the external target and recovery backups and fail without publishing. Parent-directory fsync is best effort and reported because platform support differs.
-- A write/fsync/validation/replace failure returns nonzero. The transaction restores the captured original bytes when replacement began; if restoration itself fails, it raises a high-priority error and retains the numbered backup for recovery.
-- Each unique live-transaction temporary path is checked against its recorded filesystem identity and frozen bytes before cleanup. A detected mismatch is retained and reported; a pre-commit failure also includes any cleanup residue in its error. Portable pathname cleanup cannot atomically bind that final delete to the earlier identity check across Windows, Linux, and macOS, so require a closed session and no other writer. Do not claim protection from hostile same-account directory manipulation.
-- If a valid live replacement commits but final sidecar/report publication fails, return exit code 3 with `committed-report-failed` and the committed hashes/backup labels. Do not rerun blindly or describe that state as an uncommitted failure.
-- Keep reports and temporary work outside `.claude`; do not leave ad hoc files in live session directories.
+For unusual topology, detailed status pairs, snapshot/transaction semantics or
+repair constraints, read [the format reference](references/claude-jsonl-compression-format.md)
+only as needed. Structural validation is an observed-format check, not an
+Anthropic guarantee. If runtime testing is authorized, report `/resume`,
+`/context` Messages, conversation rewind and file rewind as separate observations.

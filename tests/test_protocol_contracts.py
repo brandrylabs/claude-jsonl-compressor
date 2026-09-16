@@ -58,13 +58,14 @@ class ProtocolBase(unittest.TestCase):
             for line in group_lines:
                 if line not in required:
                     required.append(line)
-        refs = ", ".join(f"L{line}" for line in required)
+        scoped = pack.get("citation_style") == "scoped"
+        refs = ", ".join(f"[@L{line}]" if scoped else f"L{line}" for line in required)
         handoff_required = []
         for group_lines in pack.get("required_handoff_anchor_groups", {}).values():
             for line in group_lines:
                 if line not in handoff_required:
                     handoff_required.append(line)
-        handoff_refs = ", ".join(f"H{line}" for line in handoff_required)
+        handoff_refs = ", ".join(f"[@H{line}]" if scoped else f"H{line}" for line in handoff_required)
         all_refs = refs + (f", {handoff_refs}" if handoff_refs else "")
         metadata = [
             f"<!-- {ccj.MODEL_SUMMARY_MARKER}",
@@ -111,6 +112,7 @@ class ProtocolBase(unittest.TestCase):
 
     def validate_summary(self, pack, text, total_records):
         kwargs = {
+            "citation_style": pack.get("citation_style", "legacy"),
             "text": text,
             "source_digest": pack["source_sha256"],
             "omitted_digest": pack["summary_source_sha256"],
@@ -133,6 +135,309 @@ class ProtocolBase(unittest.TestCase):
 
 
 class TestSemanticProtocolContracts(ProtocolBase):
+    def test_mixed_reminders_protect_the_complete_human_turn(self):
+        before = "<system-reminder>Before note.</system-reminder>"
+        after = "<system-reminder>After note.</system-reminder>"
+        request = "My actual request: retain this review turn."
+        for as_blocks in (False, True):
+            with self.subTest(as_blocks=as_blocks):
+                tb = fx.build_linear("dddddddd-1111-4111-8111-dddddddddddd", turns=30)
+                tb.records.pop()
+                tb.compact_pair("Previous phase ended.")
+                uid = tb.user("\n".join((before, request, after)))
+                human = tb.records[-1]
+                if as_blocks:
+                    human["message"]["content"] = [{"type": "text", "text": text} for text in (before, request, after)]
+                for _ in range(12):
+                    tb.tool_call_pair()
+                tb.assistant_text("Completed current work.")
+                tb.last_prompt()
+                source = fx.write_jsonl(self.tmp / f"mixed-{as_blocks}.jsonl", tb.records)
+                options = dict(target_ratio=.05, min_recent_records=2, summary_char_budget=12000, min_recent_turns=1)
+                pre = ccj.preflight_jsonl(source, **options)
+                self.assertTrue(pre["ok"], pre)
+                self.assertEqual(pre["partition"]["availableRecentTurns"], 1)
+                self.assertEqual(pre["partition"]["rawHumanMessages"], 1)
+                pack = ccj.build_model_summary_pack_for_input(source, **options)
+                line = next(i + 1 for i, r in enumerate(tb.records) if r.get("uuid") == uid)
+                self.assertNotIn(line, pack["summary_source_lines"])
+                output = self.tmp / f"mixed-output-{as_blocks}.jsonl"
+                ccj.compress_jsonl(source, output, deterministic_summary=True, **options)
+                kept_user = next(r for r in fx.read_jsonl(output) if r.get("uuid") == uid)
+                self.assertEqual(kept_user["message"], human["message"])
+        for text in (before, before + "\n\n" + after):
+            obj = {"type": "user", "message": {"role": "user", "content": text}}
+            self.assertEqual(ccj.user_record_origin(obj), "injected")
+
+    def test_title_locator_derives_session_from_the_authoritative_chain(self):
+        for missing_leaf_session in (False, True):
+            with self.subTest(missing_leaf_session=missing_leaf_session):
+                folder = self.tmp / f"title-{missing_leaf_session}"
+                folder.mkdir()
+                a = fx.build_linear("eeeeeeee-1111-4111-8111-eeeeeeeeeeee", turns=30)
+                pointer = a.records.pop()
+                pointer.pop("sessionId")
+                if missing_leaf_session:
+                    a.records[-1].pop("sessionId")
+                b = fx.build_linear("ffffffff-2222-4222-8222-ffffffffffff", turns=1)
+                a.records.extend(b.records[:-1])
+                a.records.append({"type": "custom-title", "customTitle": "Final review name", "sessionId": a.session_id})
+                a.records.append(pointer)
+                source = fx.write_jsonl(folder / "source.jsonl", a.records)
+                self.assertTrue(ccj.choose_resume_leaf_info(a.records)["ok"])
+                self.assertEqual(cst.extract_hint(source), "Final review name")
+                self.assertEqual(cst.find_unique_session(folder, "Final review name", scan_titles=True), source)
+                output = folder / "candidate.jsonl"
+                report = ccj.compress_jsonl(source, output, .05, 4, 12000, deterministic_summary=True)
+                self.assertTrue(report["validation"]["ok"])
+                self.assertEqual(cst.extract_hint(output), "Final review name")
+
+    def test_title_locator_does_not_guess_from_a_broken_pointer_chain(self):
+        titles = [{"type": "custom-title", "customTitle": sid, "sessionId": sid} for sid in ("session-a", "session-b")]
+        for nodes in (
+            [],
+            [{"uuid": "leaf", "parentUuid": None, "sessionId": sid} for sid in ("session-a", "session-b")],
+            [{"uuid": "leaf", "parentUuid": "loop", "sessionId": "session-a"}, {"uuid": "loop", "parentUuid": "leaf"}],
+            [{"uuid": "leaf", "parentUuid": "missing", "sessionId": "session-a"}],
+        ):
+            with self.subTest(nodes=nodes):
+                records = nodes + titles + [{"type": "last-prompt", "leafUuid": "leaf"}]
+                self.assertIsNone(cst.select_session_title(records)["record"])
+
+    def test_prior_summary_spans_point_to_the_embedded_body(self):
+        tb = fx.TranscriptBuilder("abababab-4444-4444-8444-abababababab")
+        tb.compact_pair("Prior")
+        text, info = ccj.apply_prior_summary_verbatim_policy(
+            "New layer.", tb.records, list(range(len(tb.records))), 12000, True, "error")
+        span = info["preservedSpans"][0]
+        self.assertEqual(text[span["start"]:span["end"]], "Prior")
+        self.assertGreater(span["start"], text.index("## Prior Compact Summary 1"))
+        self.assertTrue(text[span["end"]:].startswith("\n\n# Current Compression Layer"))
+
+    def test_strict_old_summary_capacity_stops_before_pack_write(self):
+        tb = fx.TranscriptBuilder("08080808-8888-4888-8888-080808080808")
+        tb.compact_pair("Earlier legal interpretation. " * 800)
+        for index in range(20):
+            tb.user(f"New phase {index}")
+            tb.assistant_text("Current decision.")
+        tb.last_prompt()
+        source = fx.write_jsonl(self.tmp / "prior.jsonl", tb.records)
+        result = ccj.preflight_jsonl(source, .05, 4, 4000, preserve_prior_summaries_verbatim=True, prior_summary_overflow="error")
+        self.assertEqual(result["state"], "pack-unavailable")
+        self.assertIn("strict preservation", result["error"])
+        self.assertEqual(list(self.tmp.iterdir()), [source])
+
+    def test_turn_protection_stays_after_compact_and_current_session(self):
+        tb = fx.build_linear("09090909-9999-4999-8999-090909090909", turns=20)
+        tb.records.pop()
+        tb.compact_pair("Historic context.")
+        for index in range(3):
+            tb.user(f"Current turn {index}")
+            tb.tool_call_pair()
+            tb.assistant_text("Current reply.")
+        tb.last_prompt()
+        source = fx.write_jsonl(self.tmp / "compact-turn.jsonl", tb.records)
+        result = ccj.preflight_jsonl(source, .05, 2, 12000, min_recent_turns=50)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["partition"]["availableRecentTurns"], 3)
+        self.assertEqual(result["partition"]["rawHumanMessages"], 3)
+        # All available post-compact turns remain raw; the prior compact is summarized.
+        pack = ccj.build_model_summary_pack_for_input(source, .05, 2, 12000, min_recent_turns=50)
+        self.assertEqual(pack["prior_summary_count"], 1)
+
+    def test_exact_locator_wins_over_title_and_invalid_title_does_not_replace_name(self):
+        a = fx.build_linear("abababab-1111-4111-8111-abababababab", turns=3)
+        a.records.extend([
+            {"type": "custom-title", "customTitle": "Final", "sessionId": a.session_id},
+            {"type": "custom-title", "customTitle": []},
+            {"type": "custom-title", "customTitle": "Wrong leaf", "uuid": "bad-control", "sessionId": a.session_id},
+        ])
+        source = fx.write_jsonl(self.tmp / "exact.jsonl", a.records)
+        b = fx.build_linear("bcbcbcbc-2222-4222-8222-bcbcbcbcbcbc", turns=3)
+        b.custom_title("exact.jsonl")
+        fx.write_jsonl(self.tmp / "other.jsonl", b.records)
+        self.assertEqual(cst.extract_hint(source), "Final")
+        self.assertEqual(cst.find_unique_session(self.tmp, "exact.jsonl", scan_titles=True), source)
+
+    def test_three_rounds_keep_exact_prior_text_and_current_title(self):
+        tb = fx.build_linear("cdcdcdcd-3333-4333-8333-cdcdcdcdcdcd", turns=24)
+        tb.records.pop()
+        original = "旧裁断：不准扩大目录。Later: limited to review only.  \r\n\r\n\r\n"
+        tb.compact_pair(original)
+        for index in range(12):
+            tb.user(f"New review phase {index}")
+            tb.assistant_text("Retain history; current deadline remains unknown.")
+        tb.last_prompt()
+        for round_index in range(3):
+            tb.records.append({"type": "custom-title", "customTitle": f"Review {round_index}", "sessionId": tb.session_id})
+            source = fx.write_jsonl(self.tmp / f"round-{round_index}.jsonl", tb.records)
+            opts = dict(target_ratio=.05, min_recent_records=4, summary_char_budget=200000,
+                        preserve_prior_summaries_verbatim=True, prior_summary_overflow="error", citation_style="scoped")
+            pack = ccj.build_model_summary_pack_for_input(source, **opts)
+            model = self.tmp / f"round-{round_index}.md"
+            model.write_text(self.model_summary(pack), encoding="utf-8")
+            output = self.tmp / f"output-{round_index}.jsonl"
+            report = ccj.compress_jsonl(source, output, model_summary_path=model, **opts)
+            self.assertTrue(report["validation"]["ok"])
+            records = fx.read_jsonl(output)
+            summaries = [r for r in records if r.get("isCompactSummary") is True]
+            self.assertEqual(len(summaries), 1)
+            text = ccj.compact_summary_message_content(summaries[0])
+            self.assertIn(original, text)
+            original = text
+            self.assertEqual(cst.extract_hint(output), f"Review {round_index}")
+            pointer = records.pop()
+            tb.records = records
+            tb.prev_uuid = pointer["leafUuid"]
+            for index in range(8):
+                tb.user(f"Round {round_index} next request {index}")
+                tb.assistant_text("Only the final review directory is authorized.")
+            tb.last_prompt()
+
+    def test_scoped_citations_keep_source_identifiers_and_historical_unknowns(self):
+        tb = fx.build_linear("01010101-1111-4111-8111-010101010101", turns=40)
+        user = next(r for r in tb.records if r.get("type") == "user")
+        user["message"]["content"] = "The source labels are H1 and L999999. The information was not available in that historical phase."
+        _, pack = self.build_pack(tb.records, citation_style="scoped")
+        line = next(k for k, v in pack["required_claim_sources"].items() if v == user["message"]["content"])
+        text = self.model_summary(pack, extra_lines=(user["message"]["content"] + f" [@L{line}]",))
+        self.assertTrue(self.validate_summary(pack, text, len(tb.records))["ok"])
+        self.assertFalse(self.validate_summary(pack, text + "Unsupported claim [@L999999]\n", len(tb.records))["ok"])
+
+    def test_full_result_deduplicates_exact_strings_and_keeps_distinct_preview(self):
+        body = "完整结果：不可改写。" * 200 + " FINAL_关键条件\ufffd"
+        record = {"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "call", "content": body, "is_error": True}]},
+            "toolUseResult": {"stdout": body, "stderr": "short distinct preview"}}
+        item = ccj.model_evidence_record(record, 2, tool_evidence="full")
+        self.assertTrue(item["mandatorySemantic"])
+        self.assertEqual(item["claimSource"].count("FINAL_关键条件"), 1)
+        self.assertIn("exact_string_alias_of=", item["claimSource"])
+        self.assertIn("short distinct preview", item["claimSource"])
+        self.assertIn('is_error', item["claimSource"])
+        self.assertTrue(item["sourceTextWarning"])
+
+    def test_full_pack_overflow_is_read_only_and_does_not_sample_payload(self):
+        tb = fx.build_linear("02020202-2222-4222-8222-020202020202", turns=40, with_tools_every=3)
+        block = next(b for r in tb.records for b in ccj.content_blocks(r) if isinstance(b, dict) and b.get("type") == "tool_use")
+        block["input"]["content"] = "密集文档" * 70000
+        source = fx.write_jsonl(self.tmp / "large.jsonl", tb.records)
+        before = source.read_bytes()
+        result = ccj.preflight_jsonl(source, .05, 4, 12000, tool_evidence="full")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["state"], "pack-unavailable")
+        self.assertFalse(result["pack"]["fits"])
+        self.assertEqual(source.read_bytes(), before)
+        self.assertEqual(list(self.tmp.iterdir()), [source])
+
+    def test_preflight_distinguishes_pending_pointer_from_closed_descendant(self):
+        tb = fx.TranscriptBuilder("03030303-3333-4333-8333-030303030303")
+        tb.user("Read evidence.")
+        tb.tool_call_pair()
+        pending = tb.records[-2]["uuid"]
+        tb.last_prompt(pending)
+        tb.assistant_text("Research complete.")
+        tb.records[-1]["message"]["stop_reason"] = "end_turn"
+        source = fx.write_jsonl(self.tmp / "pending.jsonl", tb.records)
+        result = ccj.preflight_jsonl(source)
+        self.assertTrue(result["topology"]["ok"])
+        self.assertFalse(result["activeChain"]["ok"])
+        self.assertTrue(result["physicalTailCandidate"]["isSelectedChainPrefix"])
+        self.assertTrue(result["physicalTailCandidate"]["chainValidation"]["ok"])
+        self.assertFalse(result["physicalTailCandidate"]["selected"])
+
+    def test_preflight_no_old_segment_keeps_diagnostics(self):
+        source = fx.write_jsonl(self.tmp / "tiny.jsonl", fx.build_linear("04040404-4444-4444-8444-040404040404", turns=2).records)
+        result = ccj.preflight_jsonl(source, min_recent_records=120)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["state"], "nothing-to-summarize")
+        self.assertEqual(result["partition"]["oldRecords"], 0)
+
+    def test_recent_turns_protect_complete_turn_and_do_not_count_injections(self):
+        tb = fx.build_linear("05050505-5555-4555-8555-050505050505", turns=40)
+        tb.records.pop()
+        protected = tb.user("Final review request.")
+        for _ in range(8):
+            tb.tool_call_pair()
+        tb.user("<system-reminder>Display note.</system-reminder>")
+        tb.assistant_text("Ready.")
+        tb.last_prompt()
+        source = fx.write_jsonl(self.tmp / "turns.jsonl", tb.records)
+        pack = ccj.build_model_summary_pack_for_input(source, .05, 2, 12000, min_recent_turns=1)
+        line = next(i + 1 for i, r in enumerate(tb.records) if r.get("uuid") == protected)
+        self.assertNotIn(line, pack["summary_source_lines"])
+        self.assertGreater(pack["recent_record_count"], 16)
+        with self.assertRaisesRegex(ValueError, "strict active-chain"):
+            ccj.build_model_summary_pack_for_input(source, .05, 2, 12000, min_recent_turns=1, preserve_active_chain=False)
+
+    def test_title_selection_uses_final_session_and_preserves_unknown_fields(self):
+        tb = fx.build_linear("06060606-6666-4666-8666-060606060606", turns=40)
+        tb.records.insert(0, {"type": "custom-title", "customTitle": "Wrong old session", "sessionId": "old"})
+        tb.records.append({"type": "ai-title", "aiTitle": "Current automatic", "sessionId": tb.session_id, "x": 42})
+        tb.records.append({"type": "custom-title", "customTitle": "Ambiguous unowned"})
+        source = fx.write_jsonl(self.tmp / "fork.jsonl", tb.records)
+        self.assertEqual(cst.extract_hint(source), "Current automatic")
+        output = self.tmp / "fork-out.jsonl"
+        report = ccj.compress_jsonl(source, output, .05, 4, 12000, target_session_id="new-target", deterministic_summary=True)
+        title = cst.select_session_title(fx.read_jsonl(output), "new-target")["record"]
+        self.assertEqual(title, {"type": "ai-title", "aiTitle": "Current automatic", "sessionId": "new-target", "x": 42})
+        self.assertEqual(report["session_title"]["ambiguous_count"], 2)
+
+    def test_new_options_are_bound_across_both_passes(self):
+        tb = fx.build_linear("07070707-7777-4777-8777-070707070707", turns=40, with_tools_every=5)
+        source, pack = self.build_pack(tb.records, tool_evidence="full", citation_style="scoped", min_recent_turns=1, summary_char_budget=30000)
+        model = self.tmp / "model.md"
+        model.write_text(self.model_summary(pack), encoding="utf-8")
+        output = self.tmp / "candidate.jsonl"
+        settings = dict(target_ratio=.2, min_recent_records=6, summary_char_budget=30000,
+                        model_summary_path=model, tool_evidence="full", citation_style="scoped", min_recent_turns=1)
+        good = ccj.compress_jsonl(source, output, **settings)
+        self.assertTrue(good["validation"]["ok"])
+        original = output.read_bytes()
+        for key, value in (("tool_evidence", "excerpt"), ("citation_style", "legacy"), ("min_recent_turns", 0)):
+            with self.assertRaisesRegex(ValueError, "model summary validation"):
+                ccj.compress_jsonl(source, output, **dict(settings, **{key: value}))
+            self.assertEqual(output.read_bytes(), original)
+
+    def test_complete_tool_payload_and_injected_provenance(self):
+        record = {"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "Read the evidence."},
+            {"type": "tool_use", "id": "call", "name": "Bash", "input": {
+                "command": "x" * 4000 + " FINAL_CONDITION_保持历史否定"}}]}}
+        evidence = ccj.model_evidence_record(record, 1, tool_evidence="full")
+        self.assertIn("FINAL_CONDITION_保持历史否定", evidence["claimSource"])
+        self.assertTrue(evidence["mandatorySemantic"])
+        injected = {"type": "user", "isMeta": True, "message": {"role": "user", "content":
+            "<system-reminder>Do not edit outside the review directory.</system-reminder>"}}
+        self.assertFalse(ccj.is_human_user_record(injected))
+        item = ccj.model_evidence_record(injected, 2)
+        self.assertTrue(item["mandatorySemantic"])
+        self.assertIn("injected", item["classes"])
+
+    def test_latest_native_title_is_shared_with_output(self):
+        tb = fx.build_linear("11111111-2222-4333-8444-555555555555", turns=64)
+        tb.records.extend([
+            {"type": "custom-title", "sessionId": tb.session_id, "customTitle": "Old name"},
+            {"type": "custom-title", "sessionId": tb.session_id, "customTitle": "Final name", "extra": "kept"},
+        ])
+        source = fx.write_jsonl(self.tmp / "named.jsonl", tb.records)
+        self.assertEqual(cst.extract_hint(source), "Final name")
+        output = self.tmp / "result.jsonl"
+        report = ccj.compress_jsonl(source, output, .2, 6, 12000, deterministic_summary=True)
+        self.assertTrue(report["validation"]["ok"])
+        titles = [r for r in fx.read_jsonl(output) if r.get("type") == "custom-title"]
+        self.assertEqual(titles, [tb.records[-1]])
+
+    def test_verbatim_keeps_trailing_whitespace_and_strict_overflow_stops(self):
+        old = "Earlier research result.  \r\n\r\n\r\n"
+        record = {"type": "user", "isCompactSummary": True, "message": {"role": "user", "content": old}}
+        output, policy = ccj.apply_prior_summary_verbatim_policy("New layer.", [record], [0], 4000, True)
+        self.assertEqual(policy["mode"], "verbatim-preserved")
+        self.assertIn(old, output)
+        record["message"]["content"] = old * 1000
+        with self.assertRaisesRegex(ValueError, "verbatim"):
+            ccj.apply_prior_summary_verbatim_policy("New layer.", [record], [0], 4000, True, overflow="error")
+
     def test_content_free_anchor_dump_does_not_satisfy_fact_coverage(self):
         tb = fx.build_linear("11111111-aaaa-4111-8111-111111111111", turns=64)
         _source, pack = self.build_pack(tb.records, "content-free")

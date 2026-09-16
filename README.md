@@ -1,16 +1,71 @@
 # Claude JSONL Compressor
 
-[English](https://github.com/brandrylabs/claude-jsonl-compressor/blob/v1.0.0/README.md) | [简体中文](https://github.com/brandrylabs/claude-jsonl-compressor/blob/v1.0.0/docs/README.zh-CN.md) | [日本語](https://github.com/brandrylabs/claude-jsonl-compressor/blob/v1.0.0/docs/README.ja.md)
+[English](https://github.com/brandrylabs/claude-jsonl-compressor/blob/v1.1.0/README.md) | [简体中文](https://github.com/brandrylabs/claude-jsonl-compressor/blob/v1.1.0/docs/README.zh-CN.md) | [日本語](https://github.com/brandrylabs/claude-jsonl-compressor/blob/v1.1.0/docs/README.ja.md)
 
 Strict, model-assisted compression for one Claude Code session transcript, plus an independent byte-preserving compatibility repair for historical `Read.pages` records.
 
-**Release:** [`1.0.0`](CHANGELOG.md)<br>
+**Release:** [`1.1.0`](CHANGELOG.md)<br>
 **Engine:** `v10`<br>
 **Model-pack schema:** `v11`<br>
 **License:** GPL-3.0-only<br>
 **Repository:** [brandrylabs/claude-jsonl-compressor](https://github.com/brandrylabs/claude-jsonl-compressor)
 
 This project is not affiliated with Anthropic. Claude Code's transcript JSONL is an observed internal format, not a published stable storage API. Always keep the original file or a verified backup.
+
+## Version 1.1.0: bounded research evidence
+
+The goal is to reduce Claude context and cache costs without replacing them
+with unbounded summarizer work. The CLI keeps `excerpt`, `legacy`, `fold`, and
+zero protected human turns as compatible defaults. For new Codex workflows,
+use scoped citations; select full tool evidence when research lives in tool
+payloads. Run the same selection options in preflight and both passes:
+
+```text
+--preflight --tool-evidence full --citation-style scoped
+--min-recent-turns 2
+--preserve-prior-summaries-verbatim --prior-summary-overflow error
+```
+
+`--preflight` is read-only and replaces an output operation; the other flags
+are selection settings. It separates pointer topology from tool closure,
+reports a physical-tail candidate without selecting it, and checks the chosen
+pack against both existing ceilings. `nothing-to-summarize` needs no model work.
+Full evidence retains complete old active tool inputs/results and auxiliary
+results, including mixed prose/tool records and replacement characters. Exact
+long strings repeated within one record are referenced once. It does not merge
+near-duplicates, fetch external documents, or reconstruct unrecorded reasoning.
+An over-budget full pack stops; it never silently samples required payloads,
+raises the ceiling, launches more agents, or splits itself into volumes.
+
+`--citation-style scoped` uses `[@L42]` / `[@H3]` in summary prose; ordinary
+document labels such as L73/H1 remain literal. The mandatory coverage subsection
+keeps its printed L-prefix syntax. `--prior-summary-overflow error` requires
+verbatim preservation and refuses folding, including known impossible old-text
+size before model work. Pass 2 checks the actual new layer too. The legacy
+`fold` policy remains available. Exact old text includes trailing whitespace.
+
+`--min-recent-turns N` protects human-started turns after the latest compact
+and in the final session only. It may enlarge raw context and prevent meeting
+a token target; protection is never silently reduced. It is unsupported with
+physical-tail compatibility. Counts are structural, not a guarantee of rewind
+menu entries. File rewind still requires native checkpoints and their files;
+Bash changes cannot acquire checkpoints merely through JSONL compression.
+
+The final attributable custom title (or automatic title if none) is preserved,
+including a rename after the final pointer. Lookup shares that resolver and
+prefers exact path/ID matches over title scanning. Old names are not aliases.
+Unowned titles in mixed-session files are reported instead of guessed.
+
+After successful read-only preflight, make and verify a numbered source backup
+before semantic work; check its hash against preflight. Live replacement still
+creates its independent transaction backup. Default model work is one authored
+summary plus focused self-review. Explicit user requests for retrospective,
+independent, or subagent review are supported with their requested configuration.
+Review and cite relevant complete evidence; do not turn every run into repeated
+full-history review. Structural checks cannot establish semantic truth or actual
+Claude runtime compatibility. Engine v10 / model-pack v11 / report 1 remain;
+regenerate a two-pass pack after upgrading.
+
 
 ## What It Does
 
@@ -149,7 +204,7 @@ The installed directory must contain `SKILL.md`, `scripts/`, `config/`, `templat
 
 ### Install The npm CLI
 
-After version 1.0.0 is published:
+After version 1.1.0 is published:
 
 ```bash
 npm install --global @brandry/claude-jsonl-compressor
@@ -396,10 +451,10 @@ An older Codex compact boundary may retain a `preservedMessages` snapshot from t
 For an explicit exact-text request:
 
 ```text
---preserve-prior-summaries-verbatim
+--preserve-prior-summaries-verbatim --prior-summary-overflow error
 ```
 
-Use the flag in both passes. The compressor allows up to 1.5 times the configured summary character budget. If the exact block still does not fit, it reports `fallback-folded` and uses normal semantic folding. It never leaves stacked old compact pairs on the current active chain.
+Use both flags in both passes. The compressor allows up to 1.5 times the configured summary character budget and stops if strict exact preservation cannot fit. Omitting the overflow flag retains the legacy `fold` behavior: an oversized block reports `fallback-folded` and uses normal semantic folding. It never leaves stacked old compact pairs on the current active chain.
 
 ## Deterministic Fallback
 
@@ -566,17 +621,17 @@ The release suite covers active/dead branch partitioning, fixed-seed topology tr
 
 ### Maintainer Stable Release Checklist
 
-1. Confirm a clean public tree and matching `1.0.0` values in `package.json`, Python version output, docs, and tests.
+1. Confirm a clean public tree and matching `1.1.0` values in `package.json`, Python version output, docs, and tests.
 2. Run the Python, npm, isolated-Python, tarball, privacy, and offline-install gates above.
 3. Inspect `npm pack --dry-run --json`; publish only the allowlisted files.
-4. Require a clean worktree, create annotated tag `v1.0.0`, and push the commit and tag.
+4. Require a clean worktree, create annotated tag `v1.1.0`, and push the commit and tag.
 5. Publish from an authenticated maintainer environment with permission to publish this package:
 
 ```bash
 npm publish --access public --tag latest
 ```
 
-6. Verify npm version `1.0.0` and the `latest` dist-tag, then create a GitHub release (not a prerelease) from the already-pushed tag.
+6. Verify npm version `1.1.0` and the `latest` dist-tag, then create a GitHub release (not a prerelease) from the already-pushed tag.
 
 Do not append `--provenance` to a local publish. npm provenance requires a supported cloud CI runner. For later releases, prefer npm trusted publishing from a public GitHub repository on a GitHub-hosted runner with `id-token: write`, a protected release tag, and a matching protected environment; trusted publishing generates provenance automatically.
 

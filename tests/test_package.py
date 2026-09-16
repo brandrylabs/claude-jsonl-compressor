@@ -111,6 +111,7 @@ class TestNpmPackage(unittest.TestCase):
             rb"AKIA[0-9A-Z]{16}",
             rb"(?:sk|ghp)[-_][A-Za-z0-9_-]{16,}",
             rb"github_pat_[A-Za-z0-9_]{20,}",
+            rb"npm_[A-Za-z0-9]{20,}",
             rb"-----BEGIN [A-Z ]*PRIVATE KEY-----",
         ]
         for pattern in secret_patterns:
@@ -119,9 +120,20 @@ class TestNpmPackage(unittest.TestCase):
         allowed_windows_roots = (
             "c:\\data\\", "c:\\path\\", "c:\\synthetic\\", "c:\\w\\", "c:\\work\\",
         )
-        for match in re.finditer(r"(?i)\b[A-Z]:\\+(?:[^\s\"'<>|]+)", text):
-            normalized = re.sub(r"\\+", r"\\", match.group(0)).lower()
+        for match in re.finditer(r"(?i)\b[A-Z]:[\\/]+(?:[^\s\"'<>|]+)", text):
+            normalized = re.sub(r"[\\/]+", r"\\", match.group(0)).lower()
             self.assertTrue(normalized.startswith(allowed_windows_roots), f"{label}: {normalized}")
+
+    def test_privacy_gate_rejects_forward_slash_paths_and_npm_tokens(self):
+        for content in (
+            b"C:" + b"/" + b"Users/" + b"example/private.md",
+            b"D:" + b"/" + b"private/notes.md",
+            b"npm_" + b"X" * 36,
+        ):
+            with self.subTest(content_kind=content[:3]):
+                with self.assertRaises(AssertionError):
+                    self.assert_private_markers_absent("synthetic-negative-control", content)
+        self.assert_private_markers_absent("synthetic-public-example", b"C:/data/example.jsonl")
 
     def test_public_tree_is_clean_allowlisted_and_private_markers_are_absent(self):
         self.assertEqual(generated_repository_artifacts(), [])
@@ -170,7 +182,7 @@ class TestNpmPackage(unittest.TestCase):
     def test_manifest_has_no_runtime_dependencies_or_install_hooks(self):
         manifest = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["name"], "@brandry/claude-jsonl-compressor")
-        self.assertEqual(manifest["version"], "1.0.0")
+        self.assertEqual(manifest["version"], "1.1.0")
         self.assertEqual(manifest["publishConfig"]["tag"], "latest")
         self.assertEqual(manifest["license"], "GPL-3.0-only")
         self.assertEqual(manifest["engines"]["node"], ">=22")
@@ -331,7 +343,7 @@ class TestNpmPackage(unittest.TestCase):
         self.assertEqual(json.loads(node_version.stdout), json.loads(python_version.stdout))
         self.assertEqual(json.loads(python_version.stdout)["defaultModelPackEstimatedTokenBudget"], 150000)
         repair_data = json.loads(repair_version.stdout)
-        self.assertEqual(repair_data["packageVersion"], "1.0.0")
+        self.assertEqual(repair_data["packageVersion"], "1.1.0")
         self.assertEqual(repair_data["engineVersion"], "v10")
         self.assertEqual(repair_data["reportSchemaVersion"], 1)
 
@@ -340,7 +352,7 @@ class TestNpmPackage(unittest.TestCase):
             result = run(sys.executable, "-B", "-I", "-S", str(ROOT / "scripts" / script), "--version")
             self.assertEqual(result.returncode, 0, result.stderr)
             data = json.loads(result.stdout)
-            self.assertEqual(data["packageVersion"], "1.0.0")
+            self.assertEqual(data["packageVersion"], "1.1.0")
             self.assertEqual(data["engineVersion"], "v10")
 
     def test_real_npm_tarball_matches_public_allowlist_and_installs_offline(self):
@@ -409,7 +421,7 @@ class TestNpmPackage(unittest.TestCase):
                 else:
                     invoked = run(str(executable), "--version", cwd=tmp)
                 self.assertEqual(invoked.returncode, 0, invoked.stderr)
-                self.assertEqual(json.loads(invoked.stdout)["packageVersion"], "1.0.0")
+                self.assertEqual(json.loads(invoked.stdout)["packageVersion"], "1.1.0")
 
 
 if __name__ == "__main__":

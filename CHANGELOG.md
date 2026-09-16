@@ -2,6 +2,23 @@
 
 Notable public changes are recorded here. This project follows Semantic Versioning.
 
+## [1.1.0] - 2026-09-17
+
+- Add read-only `--preflight` with separate topology, tool closure, partition,
+  evidence capacity, recent human-message and snapshot diagnostics.
+- Add optional complete tool evidence with exact within-record string aliases,
+  scoped citations, strict prior-summary overflow and recent human-turn retention.
+- Preserve the final session title across renames and forked session lineage;
+  use the same title resolver for session lookup and output projection.
+- Preserve old-summary trailing whitespace and verify embedded text spans.
+- Keep injected user-format text as mandatory evidence without calling it a
+  human instruction; accept source document identifiers and historical unknowns.
+- Keep legacy CLI defaults, engine v10, model-pack v11, report 1 and zero runtime
+  dependencies. Upgrade between passes requires regenerating the evidence pack.
+- Shorten skill instructions and make additional model review opt-in or driven
+  by a concrete unresolved issue; honor explicit user review requirements.
+
+
 ## [Unreleased]
 
 ## [1.0.0] - 2026-08-11

@@ -17,7 +17,7 @@ import json
 import os
 import pathlib
 import sys
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
 def configure_stdio() -> None:
@@ -116,22 +116,86 @@ def list_session_files(root: pathlib.Path) -> List[pathlib.Path]:
     return sorted(found)
 
 
+def title_value(obj: Dict[str, Any]) -> str:
+    if obj.get("type") not in ("custom-title", "ai-title"):
+        return ""
+    native = "customTitle" if obj.get("type") == "custom-title" else "aiTitle"
+    for key in (native, "title"):
+        value = obj.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    message = obj.get("message")
+    if isinstance(message, dict):
+        value = message.get("content")
+        if isinstance(value, str) and value.strip():
+            return value
+    return ""
+
+
+def _pointer_chain_session(records: Sequence[Dict[str, Any]], pointer: Dict[str, Any]) -> Optional[str]:
+    """Resolve a session-less pointer only through an unambiguous complete chain."""
+    by_uuid: Dict[str, List[Dict[str, Any]]] = {}
+    for obj in records:
+        uid = obj.get("uuid")
+        if isinstance(uid, str) and uid:
+            by_uuid.setdefault(uid, []).append(obj)
+    current = pointer.get("leafUuid")
+    seen = set()
+    sessions = set()
+    while isinstance(current, str) and current and current not in seen:
+        matches = by_uuid.get(current, [])
+        if len(matches) != 1:
+            return None
+        seen.add(current)
+        node = matches[0]
+        owner = node.get("sessionId")
+        if isinstance(owner, str) and owner:
+            sessions.add(owner)
+        current = node.get("parentUuid")
+        if current is None:
+            return next(iter(sessions)) if len(sessions) == 1 else None
+    return None
+
+
+def select_session_title(records: Sequence[Dict[str, Any]], session_id: Optional[str] = None) -> Dict[str, Any]:
+    """Select control metadata only; never infer a conversation leaf from a title."""
+    sessions = {obj["sessionId"] for obj in records
+                if isinstance(obj.get("sessionId"), str) and obj["sessionId"]}
+    if session_id is None:
+        pointer = next((obj for obj in reversed(records) if obj.get("type") == "last-prompt"), None)
+        session_id = pointer.get("sessionId") if pointer else None
+        if not isinstance(session_id, str) or not session_id:
+            session_id = (_pointer_chain_session(records, pointer) if pointer is not None
+                          else next(iter(sessions)) if len(sessions) == 1 else None)
+    selected: Dict[str, Tuple[int, Dict[str, Any]]] = {}
+    ambiguous = 0
+    for index, obj in enumerate(records):
+        kind = obj.get("type")
+        if kind not in ("custom-title", "ai-title") or not title_value(obj):
+            continue
+        if "uuid" in obj or "parentUuid" in obj:
+            ambiguous += 1
+            continue
+        owner = obj.get("sessionId")
+        if owner is None or owner == "":
+            if not session_id or sessions != {session_id}:
+                ambiguous += 1
+                continue
+        elif not isinstance(owner, str) or owner != session_id:
+            continue
+        selected[kind] = (index, obj)
+    entry = selected.get("custom-title") or selected.get("ai-title")
+    return {"status": "selected" if entry else "ambiguous" if ambiguous else "absent",
+            "index": entry[0] if entry else None, "record": entry[1] if entry else None,
+            "ambiguousCount": ambiguous}
+
+
 def extract_hint(path: pathlib.Path) -> str:
     try:
         records = read_jsonl_records(path)
     except Exception:
         return ""
-    for obj in records:
-        for key in ("custom-title", "ai-title"):
-            if obj.get("type") == key:
-                if isinstance(obj.get("title"), str) and obj["title"].strip():
-                    return obj["title"].strip()
-                msg = obj.get("message")
-                if isinstance(msg, dict):
-                    content = msg.get("content")
-                    if isinstance(content, str) and content.strip():
-                        return content.strip().splitlines()[0][:120]
-    return ""
+    return title_value(select_session_title(records).get("record") or {}).strip()
 
 
 def numbered_backup_path(path: pathlib.Path) -> pathlib.Path:
@@ -198,15 +262,10 @@ def _path_query_match(root: pathlib.Path, path: pathlib.Path, query: str) -> boo
 
 
 def find_unique_session(root: pathlib.Path, query: str, scan_titles: bool = False) -> pathlib.Path:
-    candidates: List[pathlib.Path] = []
-    for path in list_session_files(root):
-        if _path_query_match(root, path, query):
-            candidates.append(path)
-            continue
-        if scan_titles:
-            hint = extract_hint(path).lower()
-            if hint and query.lower() in hint:
-                candidates.append(path)
+    files = list_session_files(root)
+    candidates = [path for path in files if _path_query_match(root, path, query)]
+    if not candidates and scan_titles:
+        candidates = [path for path in files if query.lower() in extract_hint(path).lower()]
     if not candidates:
         raise FileNotFoundError(f"no session matches {query!r} under {root}")
     if len(candidates) > 1:

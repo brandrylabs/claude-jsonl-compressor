@@ -1,7 +1,7 @@
 interface:
   display_name: "Claude JSONL Compressor"
   short_description: "Compress one Claude JSONL with a source-anchored model summary."
-  default_prompt: "Use $claude-jsonl-compressor on exactly one Claude Code JSONL. Run strict physically-last last-prompt preflight before semantic work; stop on malformed or ambiguous topology and exclude rewound, inactive, or unattributed branches from every evidence and output layer. Use the model-assisted two-pass workflow by default, preserve a recent raw suffix and only correlated snapshots, repeat digest-bound options across passes, and validate the candidate. For live replacement, require closed-session acknowledgement, an external work directory, a numbered verified backup, and transactional replacement. Run Read.pages repair only when explicitly requested; never install dependencies or broaden the operation to another session."
+  default_prompt: "Use $claude-jsonl-compressor on one Claude Code JSONL. Preflight the last-prompt chain and evidence capacity, exclude rewound branches, preserve its final name and requested recent context, use the model-assisted two-pass workflow, and validate the result. Follow the skill's backup, strict old-summary, cost and optional review rules; use full tool evidence when the user's research requires it. Keep repair separate and do not broaden the target."
 
 policy:
   allow_implicit_invocation: true

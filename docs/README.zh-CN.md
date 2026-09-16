@@ -4,13 +4,27 @@
 
 针对单个 Claude Code 会话记录的严格的模型辅助压缩，另外提供一个独立的、保持字节不变的兼容性修复，用于处理历史 `Read.pages` 记录。
 
-**版本：** [`1.0.0`](../CHANGELOG.md)<br>
+**版本：** [`1.1.0`](../CHANGELOG.md)<br>
 **引擎：** `v10`<br>
 **模型包 schema：** `v11`<br>
 **许可证：** GPL-3.0-only<br>
 **仓库：** [brandrylabs/claude-jsonl-compressor](https://github.com/brandrylabs/claude-jsonl-compressor)
 
 本项目与 Anthropic 无关联。Claude Code 的会话记录 JSONL 是一种观察得到的内部格式，并非公开发布的稳定存储 API。请始终保留原始文件或一份经过校验的备份。
+
+## 1.1.0：限定成本的研究证据
+
+目标是可靠节省Claude上下文与缓存费用。CLI保留excerpt/legacy/fold及0个额外保护回合的默认值；Codex新流程使用scoped引用，研究正文主要在工具载荷时选择full。
+
+- `--preflight`只读检查指针拓扑、工具闭合、所选证据包容量、近期真人消息和快照；物理末端仅作候选诊断，不自动改叶。`nothing-to-summarize`无需模型处理。
+- `--tool-evidence full`完整保留旧活动工具输入、结果和辅助结果，包括混合正文与U+FFFD；同记录完全相同长字符串只展示一次。超出既有500k字符/150k估算预算就停止，不自动分册、增预算或派更多模型。excerpt不是工具全文保真模式。
+- `--citation-style scoped`正文引用使用`[@L42]`/`[@H3]`，普通L73/H1不再误判；覆盖子节仍按打印的L前缀格式。
+- 要求旧摘要不动时同时使用`--preserve-prior-summaries-verbatim --prior-summary-overflow error`。超限不回退；尾空格/空行也原样保留。仅旧文已必然超限在模型处理前停止，新层实际大小在第二遍再验。旧fold入口仍兼容。
+- `--min-recent-turns N`保护最终会话、最近compact之后的真人回合；可能扩大raw并导致目标不可达，不自动削减。与physical-tail模式不兼容，结构计数不等于rewind菜单数量；Bash变更及缺失文件快照不能凭JSONL恢复。
+- 输出保留最终可归属自定义名称，无自定义才取自动名称，支持分叉/改名及指针后的改名；定位器共用选择器，精确ID/路径优先，旧名不作别名，多session无归属名称不猜测。
+
+预检和两遍处理须重复同一组选项。只读预检通过后、模型读取证据前建立编号备份并对齐源哈希；live替换另做事务备份。日常一次模型摘要及聚焦自检；用户主动要求回顾/独立/子智能体审阅时遵从其配置，按需读相关完整证据。结构校验不代表语义必真或Claude运行兼容。引擎v10/pack v11/report 1不变，升级后重新生成两遍任务证据包。
+
 
 ## 功能
 
@@ -149,7 +163,7 @@ Remove-Item -LiteralPath $skill -Recurse -Force
 
 ### 安装 npm CLI
 
-在 1.0.0 正式版发布之后：
+在 1.1.0 正式版发布之后：
 
 ```bash
 npm install --global @brandry/claude-jsonl-compressor
@@ -395,10 +409,10 @@ SESSION.jsonl.backup2
 对于显式的原文保留请求：
 
 ```text
---preserve-prior-summaries-verbatim
+--preserve-prior-summaries-verbatim --prior-summary-overflow error
 ```
 
-两个阶段都要使用该标志。压缩器允许最多为所配置摘要字符预算的 1.5 倍。如果原文块仍然放不下，它会报告 `fallback-folded` 并改用常规的语义折叠。它绝不会在当前活动链上留下层层堆叠的旧 compact 摘要对。
+两个阶段都要使用这两个标志。允许最多为摘要字符预算的1.5倍，严格保留放不下就停止。省略overflow标志才沿用旧fold策略：放不下时报告`fallback-folded`并语义折叠。当前活动链仍只有一对compact摘要。
 
 ## 确定性回退方案
 
@@ -565,17 +579,17 @@ npm publish --dry-run --access public --tag latest
 
 ### 维护者正式版发布清单
 
-1. 确认公共代码树干净，并且 `package.json`、Python 版本输出、文档和测试中的 `1.0.0` 取值一致。
+1. 确认公共代码树干净，并且 `package.json`、Python 版本输出、文档和测试中的 `1.1.0` 取值一致。
 2. 运行上面的 Python、npm、隔离 Python、压缩包、隐私与离线安装各项关卡。
 3. 检查 `npm pack --dry-run --json`；只发布白名单内的文件。
-4. 要求工作区干净，创建带注释的标签 `v1.0.0`，并推送该提交与标签。
+4. 要求工作区干净，创建带注释的标签 `v1.1.0`，并推送该提交与标签。
 5. 在具有此包发布权限的已认证维护者环境中发布：
 
 ```bash
 npm publish --access public --tag latest
 ```
 
-6. 核实 npm 版本 `1.0.0` 与 `latest` dist-tag，然后基于已推送的标签创建正式 GitHub Release（不要勾选 prerelease）。
+6. 核实 npm 版本 `1.1.0` 与 `latest` dist-tag，然后基于已推送的标签创建正式 GitHub Release（不要勾选 prerelease）。
 
 不要在本地发布命令后追加 `--provenance`。npm provenance 需要受支持的云端 CI runner。对于后续版本，更推荐从一个公开 GitHub 仓库、在 GitHub 托管的 runner 上使用 npm trusted publishing，并配合 `id-token: write`、受保护的发布标签以及匹配的受保护环境；trusted publishing 会自动生成 provenance。
 

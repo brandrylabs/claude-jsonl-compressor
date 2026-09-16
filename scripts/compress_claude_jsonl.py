@@ -24,9 +24,21 @@ import unicodedata
 import uuid
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+# Python -I omits the script directory. Import only the bundled sibling, never
+# a cwd/site-package module with the same name.
+import importlib.util
+_session_tools_spec = importlib.util.spec_from_file_location(
+    "_compressor_session_tools", pathlib.Path(__file__).with_name("claude_session_tools.py"))
+if _session_tools_spec is None or _session_tools_spec.loader is None:
+    raise ImportError("bundled claude_session_tools.py is unavailable")
+_session_tools = importlib.util.module_from_spec(_session_tools_spec)
+_session_tools_spec.loader.exec_module(_session_tools)
+select_session_title = _session_tools.select_session_title
+title_value = _session_tools.title_value
+
 
 JsonObj = Dict[str, Any]
-PACKAGE_VERSION = "1.0.0"
+PACKAGE_VERSION = "1.1.0"
 CODEX_OFFLINE_COMPRESSION_VERSION = "v10"
 MODEL_PACK_SCHEMA_VERSION = 11
 REPORT_SCHEMA_VERSION = 1
@@ -2907,25 +2919,41 @@ def record_text(obj: JsonObj) -> str:
     return ""
 
 
-def is_human_user_record(obj: JsonObj) -> bool:
-    if obj.get("type") != "user":
-        return False
-    if obj.get("isCompactSummary") is True:
-        return False
+def is_system_reminder_only(text: str) -> bool:
+    """Accept complete reminder blocks and whitespace, never intervening prose."""
+    opening, closing = "<system-reminder>", "</system-reminder>"
+    cursor = 0
+    while cursor < len(text):
+        if not text.startswith(opening, cursor):
+            return False
+        body_start = cursor + len(opening)
+        end = text.find(closing, body_start)
+        if end < 0 or text.find(opening, body_start, end) >= 0:
+            return False
+        cursor = end + len(closing)
+        while cursor < len(text) and text[cursor].isspace():
+            cursor += 1
+    return bool(text)
+
+
+def user_record_origin(obj: JsonObj) -> str:
+    if obj.get("type") != "user" or obj.get("isCompactSummary") is True:
+        return "not-user"
+    text = semantic_message_text(obj).strip()
+    if is_tool_result_user_record(obj) and not text:
+        return "tool-result"
+    if not text:
+        return "unknown"
+    if text.startswith(("<local-command-", "<command-")):
+        return "local-command"
+    if obj.get("isMeta") is True or is_system_reminder_only(text):
+        return "injected"
     msg = obj.get("message")
-    if not isinstance(msg, dict) or msg.get("role") != "user":
-        return False
-    content = msg.get("content")
-    if isinstance(content, str):
-        stripped = content.strip()
-        if not stripped:
-            return False
-        if stripped.startswith("<local-command-") or stripped.startswith("<command-"):
-            return False
-        return True
-    if isinstance(content, list):
-        return bool(semantic_message_text(obj).strip())
-    return False
+    return "human" if isinstance(msg, dict) and msg.get("role") == "user" else "unknown"
+
+
+def is_human_user_record(obj: JsonObj) -> bool:
+    return user_record_origin(obj) == "human"
 
 
 def is_tool_result_user_record(obj: JsonObj) -> bool:
@@ -3647,14 +3675,17 @@ def select_active_correlated_snapshot_indexes(
     return selected[-max_snapshots:]
 
 
-def select_control_projection_indexes(records: Sequence[JsonObj]) -> List[int]:
+def select_control_projection_indexes(records: Sequence[JsonObj], session_id: Optional[str] = None) -> List[int]:
     first_uuid_index = next((idx for idx, obj in enumerate(records) if isinstance(obj.get("uuid"), str)), len(records))
-    ui_types = {"mode", "permission-mode", "custom-title", "ai-title", "agent-name"}
+    ui_types = {"mode", "permission-mode", "agent-name"}
     selected = [
         idx for idx, obj in enumerate(records[:first_uuid_index])
         if isinstance(obj.get("type"), str) and obj.get("type") in ui_types and "uuid" not in obj
     ]
     selected.extend(idx for idx, obj in enumerate(records) if obj.get("type") == "last-prompt")
+    title_index = select_session_title(records, session_id)["index"]
+    if title_index is not None:
+        selected.append(title_index)
     return sorted(set(selected))
 
 
@@ -3669,6 +3700,7 @@ def choose_active_chain_preservation(
     max_file_history_snapshots: int,
     checkpoint_policy: str = "active-correlated",
     resume_leaf_override: Optional[str] = None,
+    min_recent_turns: int = 0,
 ) -> Optional[Dict[str, Any]]:
     resume_leaf_info = require_resume_leaf_info(
         records,
@@ -3724,6 +3756,15 @@ def choose_active_chain_preservation(
                 "tool relationship crosses session lineage transition; refusing to retain a cross-session raw suffix"
             )
         chain_start = adjusted_lineage_start
+    turn_floor = max(int(resume_leaf_info.get("currentSessionStartPosition") or 0),
+                     prior_compact_last_position + 1 if prior_compact_last_position is not None else 0)
+    turn_positions = [idx for idx in range(turn_floor, len(chain_records))
+                      if is_human_user_record(chain_records[idx])]
+    if min_recent_turns and turn_positions:
+        chain_start = min(chain_start, turn_positions[-min(min_recent_turns, len(turn_positions))])
+        chain_start = adjust_recent_start_for_tool_pairs(chain_records, chain_start)
+        if chain_start < turn_floor:
+            raise ValueError("recent turn tool relationship crosses the session or prior compact boundary")
     summary_pairs = chain_pairs[:chain_start]
     kept_pairs = chain_pairs[chain_start:]
     summary_indexes = [idx for idx, _ in summary_pairs]
@@ -3744,7 +3785,7 @@ def choose_active_chain_preservation(
         file_history_snapshot_indexes = []
     else:
         raise ValueError(f"unknown checkpoint policy: {checkpoint_policy}")
-    control_projection_indexes = select_control_projection_indexes(records)
+    control_projection_indexes = select_control_projection_indexes(records, resume_leaf_info.get("currentSessionId"))
     active_index_set = set(chain_indexes)
     assigned = set(summary_indexes) | set(kept_indexes) | set(file_history_snapshot_indexes) | set(control_projection_indexes)
     excluded_branch_indexes = [
@@ -3771,6 +3812,9 @@ def choose_active_chain_preservation(
         "sessionLineageTransitionCount": int(resume_leaf_info.get("sessionLineageTransitionCount") or 0),
         "sessionLineageForcedStart": session_lineage_forced_start,
         "currentSessionStartPosition": int(resume_leaf_info.get("currentSessionStartPosition") or 0) + 1,
+        "availableRecentTurns": len(turn_positions),
+        "retainedRecentTurns": sum(idx >= chain_start for idx in turn_positions),
+        "requestedRecentTurns": min_recent_turns,
         "summaryIndexes": summary_indexes,
         "rawKeepIndexes": kept_indexes,
         "sideKeepIndexes": file_history_snapshot_indexes,
@@ -4604,7 +4648,17 @@ def build_pack_request_manifest(
     preserve_prior_summaries_verbatim: bool,
     target_estimated_tokens: Optional[int],
     handoff_summary_sha256: Optional[str],
+    tool_evidence: str = "excerpt",
+    citation_style: str = "legacy",
+    prior_summary_overflow: str = "fold",
+    min_recent_turns: int = 0,
 ) -> Tuple[Dict[str, Any], str]:
+    if tool_evidence not in ("excerpt", "full") or citation_style not in ("legacy", "scoped") or prior_summary_overflow not in ("fold", "error"):
+        raise ValueError("unknown evidence, citation, or prior-summary policy")
+    if min_recent_turns < 0:
+        raise ValueError("min_recent_turns must be non-negative")
+    if prior_summary_overflow == "error" and not preserve_prior_summaries_verbatim:
+        raise ValueError("strict prior-summary overflow requires verbatim preservation")
     ensure_summary_resources()
     resource_manifest = {
         "importanceWordsSha256": canonical_json_sha256(list(IMPORTANT_WORDS)),
@@ -4631,6 +4685,12 @@ def build_pack_request_manifest(
         "handoffSummarySha256": handoff_summary_sha256,
         "resources": resource_manifest,
     }
+    for key, value, default in (
+        ("toolEvidence", tool_evidence, "excerpt"), ("citationStyle", citation_style, "legacy"),
+        ("priorSummaryOverflow", prior_summary_overflow, "fold"), ("minRecentTurns", min_recent_turns, 0),
+    ):
+        if value != default:
+            manifest[key] = value
     return manifest, canonical_json_sha256(manifest)
 
 
@@ -4750,9 +4810,10 @@ def parse_model_summary_metadata(text: str) -> Dict[str, str]:
     return metadata
 
 
-def model_summary_anchor_lines(text: str) -> List[int]:
+def model_summary_anchor_lines(text: str, citation_style: str = "legacy") -> List[int]:
     anchors: List[int] = []
-    for match in re.finditer(r"(?<![A-Za-z0-9_])L(\d{1,9})(?![A-Za-z0-9_])", text):
+    pattern = r"\[@L(\d{1,9})\]" if citation_style == "scoped" else r"(?<![A-Za-z0-9_])L(\d{1,9})(?![A-Za-z0-9_])"
+    for match in re.finditer(pattern, text):
         try:
             anchors.append(int(match.group(1)))
         except ValueError:
@@ -4760,9 +4821,10 @@ def model_summary_anchor_lines(text: str) -> List[int]:
     return anchors
 
 
-def model_summary_handoff_anchor_lines(text: str) -> List[int]:
+def model_summary_handoff_anchor_lines(text: str, citation_style: str = "legacy") -> List[int]:
     anchors: List[int] = []
-    for match in re.finditer(r"(?<![A-Za-z0-9_])H(\d{1,9})(?![A-Za-z0-9_])", text):
+    pattern = r"\[@H(\d{1,9})\]" if citation_style == "scoped" else r"(?<![A-Za-z0-9_])H(\d{1,9})(?![A-Za-z0-9_])"
+    for match in re.finditer(pattern, text):
         try:
             anchors.append(int(match.group(1)))
         except ValueError:
@@ -4852,7 +4914,10 @@ def validate_model_summary_text(
     required_claim_sources: Optional[Dict[str, str]] = None,
     expected_required_claim_sources_digest: Optional[str] = None,
     min_chars: int = 800,
+    citation_style: str = "legacy",
 ) -> Dict[str, Any]:
+    if citation_style not in ("legacy", "scoped"):
+        raise ValueError("unknown citation style")
     errors: List[str] = []
     warnings: List[str] = []
     stripped = text.strip()
@@ -5041,14 +5106,16 @@ def validate_model_summary_text(
     for line_no in coverage_body_line_numbers:
         line = body_lines[line_no - 1].strip()
         match = re.match(r"^- L(\d{1,9}) support_text_json=", line)
-        anchor_scan_lines[line_no - 1] = f"- L{match.group(1)} disposition=covered" if match else line
+        if match:
+            ref = f"[@L{match.group(1)}]" if citation_style == "scoped" else f"L{match.group(1)}"
+            anchor_scan_lines[line_no - 1] = f"- {ref} disposition=covered"
     anchor_scan_body = "\n".join(anchor_scan_lines)
     if "<!--" in anchor_scan_body or "-->" in anchor_scan_body:
         errors.append("model summary body contains an extra or unclosed HTML comment marker")
     omitted_lines = {idx + 1 for idx in omitted_indexes}
     allowed_lines = set(int(line) for line in allowed_anchor_lines) if allowed_anchor_lines is not None else None
-    anchors = model_summary_anchor_lines(anchor_scan_body)
-    handoff_anchors = model_summary_handoff_anchor_lines(anchor_scan_body)
+    anchors = model_summary_anchor_lines(anchor_scan_body, citation_style)
+    handoff_anchors = model_summary_handoff_anchor_lines(anchor_scan_body, citation_style)
     unique_anchors = sorted(set(anchors))
     invalid_range = [line for line in unique_anchors if line < 1 or line > total_records]
     if invalid_range:
@@ -5099,9 +5166,6 @@ def validate_model_summary_text(
     suspicious_patterns = [
         r"\bas an ai(?: language)? model\b",
         r"\b(?:i|we)\s+(?:do not|don't|lack)\s+(?:currently\s+)?(?:have\s+)?access\b",
-        r"\b(?:file|data|information|context|source|content)\s+(?:was|were|is|are)\s+not\s+(?:provided|available|accessible)\b",
-        r"\bno\s+(?:source|evidence|information|context)\s+(?:was\s+)?provided\b",
-        r"\baccess\s+to\s+(?:the\s+)?(?:file|data|source|context)\s+is\s+unavailable\b",
     ]
     found_suspicious = [pattern for pattern in suspicious_patterns if re.search(pattern, lower)]
     if found_suspicious:
@@ -5115,7 +5179,7 @@ def validate_model_summary_text(
             continue
         if line == "Unknown from provided anchors.":
             continue
-        if not model_summary_anchor_lines(line) and not model_summary_handoff_anchor_lines(line):
+        if not model_summary_anchor_lines(line, citation_style) and not model_summary_handoff_anchor_lines(line, citation_style):
             unanchored_lines.append((line_no, truncate(line, 160)))
     if unanchored_lines:
         errors.append(f"model summary has substantive lines without line anchors: {unanchored_lines[:8]}")
@@ -5137,7 +5201,7 @@ def validate_model_summary_text(
         start = heading_matches[match_index].end()
         end = heading_matches[match_index + 1].start() if match_index + 1 < len(heading_matches) else len(anchor_scan_body)
         section_text = anchor_scan_body[start:end]
-        if not model_summary_anchor_lines(section_text) and not model_summary_handoff_anchor_lines(section_text):
+        if not model_summary_anchor_lines(section_text, citation_style) and not model_summary_handoff_anchor_lines(section_text, citation_style):
             section_anchor_errors.append(heading)
     if section_anchor_errors:
         errors.append(f"required semantic sections lack evidence anchors: {section_anchor_errors}")
@@ -5239,23 +5303,27 @@ def collect_prior_compact_summaries(
     return summaries
 
 
-def format_verbatim_prior_summary_block(prior_summaries: Sequence[Dict[str, Any]]) -> str:
-    lines = [
+def format_verbatim_prior_summary_block(
+    prior_summaries: Sequence[Dict[str, Any]],
+    spans: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    intro = "\n".join([
         "# Preserved Prior Compact Summaries",
         "",
         "The following prior `isCompactSummary` message contents are copied verbatim because the user explicitly requested preservation across repeated compression. They are embedded inside this new single compact summary; the old compact records are not kept as additional live compact pairs.",
-    ]
+    ])
+    parts = [intro]
+    chars = len(intro)
     for pos, item in enumerate(prior_summaries, 1):
-        lines.extend(
-            [
-                "",
-                f"## Prior Compact Summary {pos}",
-                f"<!-- source_line: {item.get('sourceLine')} uuid: {item.get('uuid') or 'none'} sha256_prefix: {item.get('sha256Prefix')} chars: {item.get('chars')} -->",
-                "",
-                str(item.get("text") or ""),
-            ]
-        )
-    return "\n".join(lines).strip()
+        prefix = (f"\n\n## Prior Compact Summary {pos}\n"
+                  f"<!-- source_line: {item.get('sourceLine')} uuid: {item.get('uuid') or 'none'} sha256_prefix: {item.get('sha256Prefix')} chars: {item.get('chars')} -->\n\n")
+        original = str(item.get("text") or "")
+        start = chars + len(prefix)
+        chars = start + len(original)
+        if spans is not None:
+            spans.append({"start": start, "end": chars, "sha256": sha256_hex(original.encode("utf-8"))})
+        parts.extend((prefix, original))
+    return "".join(parts)
 
 
 def apply_prior_summary_verbatim_policy(
@@ -5264,7 +5332,10 @@ def apply_prior_summary_verbatim_policy(
     omitted_indexes: Sequence[int],
     summary_char_budget: int,
     requested: bool,
+    overflow: str = "fold",
 ) -> Tuple[str, Dict[str, Any]]:
+    if overflow not in ("fold", "error"):
+        raise ValueError("unknown prior summary overflow policy")
     prior_summaries = collect_prior_compact_summaries(omitted, omitted_indexes)
     info: Dict[str, Any] = {
         "requested": bool(requested),
@@ -5294,7 +5365,8 @@ def apply_prior_summary_verbatim_policy(
         info["mode"] = "requested-no-prior-summaries"
         return summary_text, info
 
-    verbatim_block = format_verbatim_prior_summary_block(prior_summaries)
+    spans: List[Dict[str, Any]] = []
+    verbatim_block = format_verbatim_prior_summary_block(prior_summaries, spans)
     candidate = "\n\n".join(
         [
             verbatim_block,
@@ -5304,10 +5376,19 @@ def apply_prior_summary_verbatim_policy(
     ).strip() + "\n"
     info["candidateSummaryChars"] = len(candidate)
     if len(candidate) <= expanded_budget:
+        cursor = 0
+        for item, span in zip(prior_summaries, spans):
+            original = str(item["text"])
+            if span["start"] < cursor or candidate[span["start"]:span["end"]] != original:
+                raise AssertionError("verbatim prior summary text changed or its order was lost")
+            cursor = span["end"]
+        info["preservedSpans"] = spans
         info["mode"] = "verbatim-preserved"
         info["preservedCount"] = len(prior_summaries)
         return candidate, info
 
+    if overflow == "error":
+        raise ValueError(f"verbatim prior summaries require {len(candidate)} chars, above expanded summary budget {expanded_budget}; strict preservation forbids folding")
     info["mode"] = "fallback-folded"
     info["fallbackReason"] = (
         f"verbatim prior summaries would make summary {len(candidate)} chars, "
@@ -5327,7 +5408,39 @@ def pack_json_string(text: str) -> str:
     )
 
 
-def model_evidence_record(obj: JsonObj, original_line: int) -> Optional[Dict[str, Any]]:
+def full_tool_evidence_text(obj: JsonObj) -> str:
+    """A field ledger with exact, within-record string aliases; never executes payloads."""
+    parts: List[str] = []
+    seen: Dict[str, str] = {}
+
+    def emit(path: str, value: Any) -> None:
+        if isinstance(value, dict) and value:
+            for key, item in value.items():
+                emit(f"{path}[{json.dumps(key, ensure_ascii=False)}]", item)
+        elif isinstance(value, list) and value:
+            for index, item in enumerate(value):
+                emit(f"{path}[{index}]", item)
+        elif isinstance(value, str) and len(value) >= 80 and value in seen:
+            parts.append(f"{path} exact_string_alias_of={seen[value]}")
+        else:
+            parts.append(f"{path}={pack_json_string(value) if isinstance(value, str) else json.dumps(value, ensure_ascii=False)}")
+            if isinstance(value, str) and len(value) >= 80:
+                seen[value] = path
+
+    prose = semantic_message_text(obj)
+    if prose:
+        emit("prose", prose)
+    if obj.get("sourceToolAssistantUUID") is not None:
+        emit("sourceToolAssistantUUID", obj["sourceToolAssistantUUID"])
+    for index, block in enumerate(content_blocks(obj)):
+        if isinstance(block, dict) and block.get("type") in ("tool_use", "tool_result"):
+            emit(f"content[{index}]", block)
+    if obj.get("toolUseResult") is not None:
+        emit("toolUseResult", obj["toolUseResult"])
+    return "\n".join(parts)
+
+
+def model_evidence_record(obj: JsonObj, original_line: int, tool_evidence: str = "excerpt") -> Optional[Dict[str, Any]]:
     is_prior_summary = obj.get("isCompactSummary") is True
     semantic_txt = semantic_message_text(obj)
     is_human_semantic = is_human_user_record(obj) and bool(semantic_txt.strip())
@@ -5335,8 +5448,11 @@ def model_evidence_record(obj: JsonObj, original_line: int) -> Optional[Dict[str
         obj.get("type") == "assistant"
         and bool(semantic_txt.strip())
     )
-    mandatory_semantic = is_human_semantic or is_assistant_semantic
-    txt = semantic_txt if mandatory_semantic or is_prior_summary else record_text(obj)
+    origin = user_record_origin(obj)
+    is_injected_semantic = origin in ("injected", "unknown") and obj.get("type") == "user" and bool(semantic_txt.strip()) and not is_prior_summary
+    full_tool = tool_evidence == "full" and bool(tool_use_ids(obj) or is_tool_result_user_record(obj))
+    mandatory_semantic = is_human_semantic or is_assistant_semantic or is_injected_semantic or full_tool
+    txt = full_tool_evidence_text(obj) if full_tool else semantic_txt if mandatory_semantic or is_prior_summary else record_text(obj)
     noisy = is_noisy_text(txt)
     if not txt or (noisy and not mandatory_semantic and not is_prior_summary):
         return None
@@ -5350,10 +5466,15 @@ def model_evidence_record(obj: JsonObj, original_line: int) -> Optional[Dict[str
         prefix += f" ts={timestamp}"
     if uid:
         prefix += f" uuid={uid}"
+    # Full payloads are mandatory; scoring them cannot affect inclusion. Bound
+    # heuristic scans to avoid repeatedly searching megabyte-long tool strings.
+    ranking_text = semantic_txt[:2000] if full_tool else txt
     importance = 0
+    if full_tool or is_injected_semantic:
+        importance += 5
     if is_human_semantic:
         importance += 5
-    if text_has_any(txt, IMPORTANT_WORDS):
+    if text_has_any(ranking_text, IMPORTANT_WORDS):
         importance += 4
     if is_prior_summary:
         importance += 4
@@ -5361,25 +5482,30 @@ def model_evidence_record(obj: JsonObj, original_line: int) -> Optional[Dict[str
         importance += 3
     if obj.get("type") == "assistant":
         importance += 1
-        decision_score = assistant_research_decision_score(txt)
+        decision_score = assistant_research_decision_score(ranking_text)
         if decision_score:
             importance += min(24, 4 + decision_score)
-    if extract_paths(txt):
+    has_path = bool(extract_paths(ranking_text))
+    if has_path:
         importance += 1
     classes: List[str] = []
+    if is_injected_semantic:
+        classes.append(origin)
+    if full_tool:
+        classes.append("complete-tool-payload")
     if is_human_semantic:
         classes.append("human-user")
-        if text_has_any(txt, IMPORTANT_WORDS):
+        if text_has_any(ranking_text, IMPORTANT_WORDS):
             classes.append("human-constraint")
     if is_assistant_semantic:
         classes.append("assistant-semantic")
-        if assistant_research_decision_score(txt):
+        if assistant_research_decision_score(ranking_text):
             classes.append("assistant-research")
             classes.extend(
                 f"assistant-research-{group}"
-                for group in assistant_decision_language_groups(txt)
+                for group in assistant_decision_language_groups(ranking_text)
             )
-    if tool_use_ids(obj) or is_tool_result_user_record(obj) or extract_paths(txt):
+    if tool_use_ids(obj) or is_tool_result_user_record(obj) or has_path:
         classes.append("source-tool")
     if is_prior_summary:
         classes.append("prior-summary")
@@ -5401,7 +5527,7 @@ def model_evidence_record(obj: JsonObj, original_line: int) -> Optional[Dict[str
         "classes": classes,
         "priorSummary": is_prior_summary,
         "mandatorySemantic": mandatory_semantic,
-        "semanticKind": "human-user" if is_human_semantic else "assistant-semantic" if is_assistant_semantic else None,
+        "semanticKind": "complete-tool" if full_tool else origin if is_injected_semantic else "human-user" if is_human_semantic else "assistant-semantic" if is_assistant_semantic else None,
         "claimSource": txt if is_prior_summary or mandatory_semantic else None,
         "sourceTextWarning": noisy,
     }
@@ -5438,6 +5564,7 @@ def select_model_evidence_payload(
     omitted_indexes: Sequence[int],
     char_budget: int,
     estimated_token_budget: Optional[int] = None,
+    tool_evidence: str = "excerpt",
 ) -> Dict[str, Any]:
     omitted_order = {idx: pos for pos, idx in enumerate(omitted_indexes)}
     omitted_count = len(omitted_indexes)
@@ -5450,7 +5577,7 @@ def select_model_evidence_payload(
     evidence: List[Dict[str, Any]] = []
     optional_omissions: Dict[int, str] = {}
     for idx in omitted_indexes:
-        item = model_evidence_record(records[idx], idx + 1)
+        item = model_evidence_record(records[idx], idx + 1, tool_evidence=tool_evidence)
         if item is None:
             if record_text(records[idx]).strip():
                 optional_omissions[idx] = "noise-or-ineligible"
@@ -5458,7 +5585,8 @@ def select_model_evidence_payload(
         if int(item["importance"]) <= 0:
             optional_omissions[idx] = "zero-priority"
             continue
-        item["priority"] = model_evidence_priority(records, idx, int(item["importance"]))
+        item["priority"] = (int(item["importance"]) if "complete-tool-payload" in item["classes"]
+                            else model_evidence_priority(records, idx, int(item["importance"])))
         item["temporalGroup"] = temporal_group(idx)
         evidence.append(item)
     if not evidence:
@@ -5639,6 +5767,9 @@ def render_model_summary_pack_text(
     session_lineage_transition_count: int = 0,
     mandatory_semantic_record_count: int = 0,
     estimated_token_budget: int = DEFAULT_MODEL_PACK_ESTIMATED_TOKEN_BUDGET,
+    tool_evidence: str = "excerpt",
+    citation_style: str = "legacy",
+    prior_summary_overflow: str = "fold",
 ) -> str:
     evidence_lines_digest = anchor_lines_digest(evidence_anchor_lines)
     required_groups_digest = anchor_groups_digest(required_anchor_groups)
@@ -5670,7 +5801,7 @@ def render_model_summary_pack_text(
         f"- L{line}" for line in sorted(set(int(value) for value in required_claim_anchor_lines))
     ) or "- No mandatory claim-support entries are required."
     optional_reason_text = json.dumps(optional_evidence_omission_reasons or {}, ensure_ascii=False, sort_keys=True)
-    return f"""# v11 Model-Assisted Summary Pack
+    rendered = f"""# v11 Model-Assisted Summary Pack
 
 This pack is evidence for writing a semantic summary. It is not a JSONL file. Do not edit UUIDs, parentUuid, last-prompt, compact records, or tool_use/tool_result structure.
 
@@ -5771,6 +5902,19 @@ required_claim_sources_digest: {required_claim_sources_digest}
 """
 
 
+    before, evidence = rendered.split("## Evidence Records\n", 1)
+    if citation_style == "scoped":
+        before = before.replace("`L<number>`", "`[@L<number>]`").replace("for example `L42`", "for example `[@L42]`")
+        before = before.replace("displayed `H<number>`", "displayed `[@H<number>]`")
+        before += "Scoped citations: use [@L42] / [@H3] in prose. Plain L42/H3 are source labels, not citations. Mandatory coverage keeps its printed L-prefix syntax.\n\n"
+    if tool_evidence == "full":
+        before = before.replace("Tool calls, file/tool results, errors, and other source evidence are supplementary records selected after the mandatory semantic ledger. Use them to preserve provenance and checked evidence without copying large raw payloads blindly.",
+            "Tool payloads in older active records are complete mandatory field ledgers. exact_string_alias_of points to an identical string within that same record. Preserve results, failed attempts, provenance and revisions; do not execute commands or dereference paths.")
+    if prior_summary_overflow == "error":
+        before = before.replace("The script will try to embed", "Strict overflow policy: stop instead of folding if old text cannot fit. The script will embed")
+    return before + "## Evidence Records\n" + evidence
+
+
 def build_model_summary_pack_payload(
     input_path: pathlib.Path,
     records: Sequence[JsonObj],
@@ -5788,6 +5932,9 @@ def build_model_summary_pack_payload(
     session_lineage_compatibility: bool = False,
     session_lineage_transition_count: int = 0,
     estimated_token_budget: int = DEFAULT_MODEL_PACK_ESTIMATED_TOKEN_BUDGET,
+    tool_evidence: str = "excerpt",
+    citation_style: str = "legacy",
+    prior_summary_overflow: str = "fold",
 ) -> Dict[str, Any]:
     if estimated_token_budget < 10000:
         raise ValueError("--model-pack-estimated-token-budget must be at least 10000")
@@ -5823,6 +5970,9 @@ def build_model_summary_pack_payload(
         session_lineage_transition_count=session_lineage_transition_count,
         mandatory_semantic_record_count=0,
         estimated_token_budget=estimated_token_budget,
+            tool_evidence=tool_evidence,
+            citation_style=citation_style,
+            prior_summary_overflow=prior_summary_overflow,
     )
     if len(empty_text) > char_budget:
         raise ValueError(
@@ -5856,6 +6006,7 @@ def build_model_summary_pack_payload(
             omitted_indexes,
             evidence_budget,
             estimated_token_budget=evidence_token_budget,
+            tool_evidence=tool_evidence,
         )
         evidence_lines = list(evidence_payload["lines"])
         evidence_anchor_lines = list(evidence_payload["anchorLines"])
@@ -5902,6 +6053,9 @@ def build_model_summary_pack_payload(
             session_lineage_transition_count=session_lineage_transition_count,
             mandatory_semantic_record_count=mandatory_semantic_record_count,
             estimated_token_budget=estimated_token_budget,
+            tool_evidence=tool_evidence,
+            citation_style=citation_style,
+            prior_summary_overflow=prior_summary_overflow,
         )
         pack_estimated_tokens = estimate_tokens(pack_text)
         if len(pack_text) <= char_budget and pack_estimated_tokens <= estimated_token_budget:
@@ -6373,7 +6527,13 @@ def select_preservation_plan(
     max_file_history_snapshots: int,
     checkpoint_policy: str = "active-correlated",
     resume_leaf_override: Optional[str] = None,
+    min_recent_turns: int = 0,
+    allow_empty_summary: bool = False,
 ) -> Dict[str, Any]:
+    if min_recent_turns < 0:
+        raise ValueError("min_recent_turns must be non-negative")
+    if min_recent_turns and not preserve_active_chain:
+        raise ValueError("--min-recent-turns requires strict active-chain mode")
     summary_budget_bytes = max(4096, summary_char_budget * 3 + 20000)
     preserve_info: Optional[Dict[str, Any]] = None
     file_history_snapshots_original: List[JsonObj] = []
@@ -6390,6 +6550,7 @@ def select_preservation_plan(
             max_file_history_snapshots,
             checkpoint_policy,
             resume_leaf_override,
+            min_recent_turns=min_recent_turns,
         )
         if preserve_info is None:
             raise ValueError("strict active-chain topology selected no chain")
@@ -6444,7 +6605,7 @@ def select_preservation_plan(
         excluded_branch_indexes = list(preserve_info.get("excludedBranchIndexes") or [])
         excluded_unattributed_indexes = list(preserve_info.get("excludedUnattributedIndexes") or [])
         last_prompt_template = copy.deepcopy(preserve_info.get("lastPromptTemplate"))
-        if not summary_indexes:
+        if not summary_indexes and not allow_empty_summary:
             raise ValueError("active resume chain has no old records to summarize with the requested settings")
     return {
         "preserve_info": preserve_info,
@@ -6540,6 +6701,94 @@ def validate_source_active_chain_for_plan(
     return validation
 
 
+def check_strict_prior_capacity(plan: Dict[str, Any], summary_char_budget: int,
+                                requested: bool, overflow: str) -> None:
+    if requested and overflow == "error":
+        # Even an empty new layer must fit. Pass 2 checks its actual complete size.
+        apply_prior_summary_verbatim_policy("", plan["omitted"], plan["omitted_indexes"],
+                                            summary_char_budget, True, overflow="error")
+
+
+def preflight_jsonl(input_path: pathlib.Path, target_ratio: float = .3, min_recent_records: int = 120,
+                    summary_char_budget: int = 60000, **options: Any) -> Dict[str, Any]:
+    """No writes or model calls. Topology, exchange closure, partition and capacity are distinct."""
+    source = input_path.read_bytes()
+    records, raw_lines, physical = parse_jsonl_bytes_with_lines(source)
+    info = choose_resume_leaf_info(records, options.get("max_post_prompt_extension", 0), options.get("resume_leaf_override"))
+    result: Dict[str, Any] = {"ok": False, "source_sha256": sha256_hex(source),
+        "topology": public_resume_leaf_info(info), "state": "topology-invalid"}
+    if not info["ok"]:
+        return result
+
+    def chain_check(topology: Dict[str, Any]) -> Dict[str, Any]:
+        indexes = topology.get("activeChainIndexes") or []
+        plan = {"preserve_info": {"resumeLeafInfo": topology}, "selected_leaf_uuid": topology.get("selectedLeafUuid"),
+                "last_prompt_template": topology.get("lastPromptTemplate")}
+        last_api = next((records[i] for i in reversed(indexes) if is_api_message(records[i])), {})
+        message = last_api.get("message") if isinstance(last_api.get("message"), dict) else {}
+        out: Dict[str, Any] = {"records": len(indexes), "lastApiStopReason": _bounded_diagnostic_label(message.get("stop_reason"))}
+        try:
+            validation = validate_source_active_chain_for_plan(records, plan, physical_lines=physical)
+            out.update(ok=True, warnings=validation.get("warnings", []))
+        except ValueError as exc:
+            out.update(ok=False, error=_bounded_diagnostic_text(str(exc)))
+        return out
+
+    result["activeChain"] = chain_check(info)
+    candidate_leaf = latest_physical_uuid(records)
+    if candidate_leaf != info["selectedLeafUuid"]:
+        candidate = choose_resume_leaf_info(records, resume_leaf_override=candidate_leaf)
+        selected_indexes = info["activeChainIndexes"]
+        candidate_indexes = candidate.get("activeChainIndexes") or []
+        result["physicalTailCandidate"] = {"topologyOk": candidate["ok"], "reasonCode": candidate["reasonCode"],
+            "isSelectedChainPrefix": candidate_indexes[:len(selected_indexes)] == selected_indexes,
+            "additionalRecords": len(candidate_indexes) - len(selected_indexes) if candidate["ok"] else None,
+            "leafPhysicalLine": next((physical[i] for i, r in enumerate(records) if r.get("uuid") == candidate_leaf), None),
+            "selected": False}
+        if candidate["ok"]:
+            result["physicalTailCandidate"]["chainValidation"] = chain_check(candidate)
+    if not result["activeChain"]["ok"]:
+        result["state"] = "selected-chain-invalid"
+        return result
+    ratio, input_tokens = effective_target_ratio_for_tokens(records, target_ratio, options.get("target_estimated_tokens"))
+    try:
+        plan = select_preservation_plan(records, raw_lines, len(source), ratio, min_recent_records, summary_char_budget,
+            options.get("preserve_active_chain", True), options.get("max_post_prompt_extension", 0),
+            options.get("max_file_history_snapshots", 80), options.get("checkpoint_policy", "active-correlated"),
+            options.get("resume_leaf_override"), options.get("min_recent_turns", 0), allow_empty_summary=True)
+    except ValueError as exc:
+        result.update(state="partition-unavailable", error=_bounded_diagnostic_text(str(exc)))
+        return result
+    older = plan["omitted"]
+    result["estimates"] = {"inputStructuredTokens": input_tokens,
+        "activeStructuredTokens": estimate_records_tokens([records[i] for i in info["activeChainIndexes"]]),
+        "rawStructuredTokens": estimate_records_tokens(plan["kept_original"]),
+        "oldCompleteToolChars": sum(len(full_tool_evidence_text(r)) for r in older if tool_use_ids(r) or is_tool_result_user_record(r)),
+        "oldPriorSummaryChars": sum(len(compact_summary_message_content(r)) for r in older if r.get("isCompactSummary") is True)}
+    result["partition"] = {"oldRecords": len(older), "rawRecords": len(plan["kept_original"]),
+        "oldUserOrigins": dict(collections.Counter(user_record_origin(r) for r in older if r.get("type") == "user")),
+        "rawHumanMessages": sum(is_human_user_record(r) for r in plan["kept_original"]),
+        "retainedSnapshots": len(plan["file_history_snapshots_original"]),
+        "requestedRecentTurns": options.get("min_recent_turns", 0),
+        "availableRecentTurns": (plan.get("preserve_info") or {}).get("availableRecentTurns", 0)}
+    title = select_session_title(records, info.get("currentSessionId"))
+    result["sessionTitle"] = {"status": title["status"], "ambiguousCount": title["ambiguousCount"],
+                              "sourceLine": physical[title["index"]] if title["index"] is not None else None}
+    if not older:
+        result.update(ok=True, state="nothing-to-summarize", pack=None)
+        return result
+    try:
+        pack = build_model_summary_pack_for_input(input_path, target_ratio, min_recent_records, summary_char_budget, **options)
+        if pack["source_sha256"] != result["source_sha256"] or input_path.read_bytes() != source:
+            raise ValueError("source changed during preflight; repeat before semantic work")
+        result["pack"] = {"chars": pack["pack_chars"], "estimatedTokens": pack["pack_estimated_tokens"],
+                          "mandatoryRecords": pack["mandatory_semantic_record_count"], "fits": True}
+        result.update(ok=True, state="ready")
+    except ValueError as exc:
+        result.update(state="pack-unavailable", error=_bounded_diagnostic_text(str(exc)), pack={"fits": False})
+    return result
+
+
 def build_model_summary_pack_for_input(
     input_path: pathlib.Path,
     target_ratio: float,
@@ -6555,6 +6804,10 @@ def build_model_summary_pack_for_input(
     handoff_summary_path: Optional[pathlib.Path] = None,
     preserve_prior_summaries_verbatim: bool = False,
     target_estimated_tokens: Optional[int] = None,
+    tool_evidence: str = "excerpt",
+    citation_style: str = "legacy",
+    prior_summary_overflow: str = "fold",
+    min_recent_turns: int = 0,
 ) -> Dict[str, Any]:
     require_summary_char_budget(summary_char_budget)
     if min_recent_records < 0:
@@ -6581,12 +6834,14 @@ def build_model_summary_pack_for_input(
         max_file_history_snapshots,
         checkpoint_policy,
         resume_leaf_override,
+        min_recent_turns=min_recent_turns,
     )
     source_active_chain_validation = validate_source_active_chain_for_plan(
         records,
         plan,
         physical_lines=physical_lines,
     )
+    check_strict_prior_capacity(plan, summary_char_budget, preserve_prior_summaries_verbatim, prior_summary_overflow)
     source_sha256 = sha256_hex(source_bytes)
     source_digest = source_sha256
     omitted_digest = sha256_hex("\n".join(raw_lines[idx] for idx in plan["omitted_indexes"]).encode("utf-8"))
@@ -6605,6 +6860,10 @@ def build_model_summary_pack_for_input(
         preserve_prior_summaries_verbatim=preserve_prior_summaries_verbatim,
         target_estimated_tokens=target_estimated_tokens,
         handoff_summary_sha256=handoff_digest,
+        tool_evidence=tool_evidence,
+        citation_style=citation_style,
+        prior_summary_overflow=prior_summary_overflow,
+        min_recent_turns=min_recent_turns,
     )
     pack = build_model_summary_pack_payload(
         input_path=input_path,
@@ -6623,6 +6882,9 @@ def build_model_summary_pack_for_input(
         session_lineage_compatibility=bool(plan["session_lineage_compatibility"]),
         session_lineage_transition_count=int(plan["session_lineage_transition_count"]),
         estimated_token_budget=model_pack_estimated_token_budget,
+        tool_evidence=tool_evidence,
+        citation_style=citation_style,
+        prior_summary_overflow=prior_summary_overflow,
     )
     pack_text = str(pack["text"])
     evidence_anchor_lines = list(pack["evidence_anchor_lines"])
@@ -6634,6 +6896,10 @@ def build_model_summary_pack_for_input(
         "source_sha256_prefix": source_sha256[:16],
         "source_sha256": source_sha256,
         "omitted_digest": omitted_digest,
+        "tool_evidence": tool_evidence,
+        "citation_style": citation_style,
+        "prior_summary_overflow": prior_summary_overflow,
+        "min_recent_turns": min_recent_turns,
         "summary_source_sha256": omitted_digest,
         "omitted_record_count": len(plan["omitted_indexes"]),
         "recent_record_count": len(plan["kept_original"]),
@@ -6706,6 +6972,10 @@ def compress_jsonl(
     resume_leaf_override: Optional[str] = None,
     target_estimated_tokens: Optional[int] = None,
     write_sidecar_files: bool = True,
+    tool_evidence: str = "excerpt",
+    citation_style: str = "legacy",
+    prior_summary_overflow: str = "fold",
+    min_recent_turns: int = 0,
 ) -> Dict[str, Any]:
     require_summary_char_budget(summary_char_budget)
     if min_recent_records < 0:
@@ -6744,6 +7014,10 @@ def compress_jsonl(
         preserve_prior_summaries_verbatim=preserve_prior_summaries_verbatim,
         target_estimated_tokens=target_estimated_tokens,
         handoff_summary_sha256=handoff_digest,
+        tool_evidence=tool_evidence,
+        citation_style=citation_style,
+        prior_summary_overflow=prior_summary_overflow,
+        min_recent_turns=min_recent_turns,
     )
     source_sha256 = sha256_hex(source_bytes)
     source_digest = source_sha256
@@ -6762,12 +7036,14 @@ def compress_jsonl(
         max_file_history_snapshots,
         checkpoint_policy,
         resume_leaf_override,
+        min_recent_turns=min_recent_turns,
     )
     source_active_chain_validation = validate_source_active_chain_for_plan(
         records,
         plan,
         physical_lines=physical_lines,
     )
+    check_strict_prior_capacity(plan, summary_char_budget, preserve_prior_summaries_verbatim, prior_summary_overflow)
     preserve_info = plan["preserve_info"]
     omitted = list(plan["omitted"])
     kept_original = list(plan["kept_original"])
@@ -6851,6 +7127,9 @@ def compress_jsonl(
             session_lineage_compatibility=session_lineage_compatibility,
             session_lineage_transition_count=session_lineage_transition_count,
             estimated_token_budget=model_pack_estimated_token_budget,
+            tool_evidence=tool_evidence,
+            citation_style=citation_style,
+            prior_summary_overflow=prior_summary_overflow,
         )
         model_pack_estimated_tokens = int(pack_for_validation.get("estimated_tokens") or 0)
         model_pack_evidence_truncated = bool(pack_for_validation.get("evidence_truncated"))
@@ -6883,6 +7162,7 @@ def compress_jsonl(
             expected_pack_request_digest=pack_request_digest,
             required_claim_sources=dict(pack_for_validation.get("required_claim_sources") or {}),
             expected_required_claim_sources_digest=str(pack_for_validation["required_claim_sources_digest"]),
+            citation_style=citation_style,
         )
         if not model_summary_validation.get("ok"):
             raise ValueError(f"model summary validation failed: {model_summary_validation.get('errors')}")
@@ -6894,6 +7174,7 @@ def compress_jsonl(
         omitted_indexes,
         summary_char_budget,
         preserve_prior_summaries_verbatim,
+        overflow=prior_summary_overflow,
     )
     kept_first_uuid = next((obj.get("uuid") for obj in kept if isinstance(obj.get("uuid"), str)), None)
     parent_uuid = None
@@ -6980,15 +7261,24 @@ def compress_jsonl(
     # Only project explicitly classified prefix metadata. No physical-window
     # scan is allowed here because it could resurrect an inactive branch.
     safe_prefix: List[JsonObj] = []
+    source_title = select_session_title(records)
+    # Explicit target normalization must not change which source session owns a title.
+    if preserve_info:
+        source_title = select_session_title(records, preserve_info["resumeLeafInfo"].get("currentSessionId"))
+    projected_title = copy.deepcopy(source_title.get("record"))
+    if projected_title is not None and summary_session:
+        projected_title["sessionId"] = summary_session
     for idx in control_projection_indexes:
         obj = records[idx]
-        if obj.get("type") == "last-prompt":
+        if obj.get("type") in ("last-prompt", "custom-title", "ai-title"):
             continue
         safe_obj = copy.deepcopy(obj)
         if target_session_id:
             normalized_session_records += normalize_session_ids([safe_obj], target_session_id)
         safe_prefix.append(safe_obj)
     output_records: List[JsonObj] = safe_prefix + file_history_snapshots + [boundary, summary] + recent_out
+    if projected_title is not None:
+        output_records.append(projected_title)
     last_prompt_updates = 0
     final_last_prompt_appended = 0
     if append_final_prompt or target_session_id or preserve_active_chain:
@@ -6996,6 +7286,8 @@ def compress_jsonl(
             output_records, last_prompt_template, target_session_id
         )
     compact_preserved_metadata_updates = update_compact_preserved_metadata(output_records, boundary_uuid, summary_uuid)
+    if projected_title is not None and select_session_title(output_records, summary_session).get("record") != projected_title:
+        raise ValueError("final session title projection did not preserve the selected source record")
     active_chain_window = summarize_active_chain_window(output_records, summary_uuid)
     output_estimated_tokens = estimate_records_tokens(output_records)
     if target_estimated_tokens is not None and output_estimated_tokens > target_estimated_tokens:
@@ -7014,6 +7306,13 @@ def compress_jsonl(
         "report_schema_version": REPORT_SCHEMA_VERSION,
         "model_pack_schema_version": MODEL_PACK_SCHEMA_VERSION,
         "model_pack_request_digest": pack_request_digest,
+        "tool_evidence": tool_evidence,
+        "citation_style": citation_style,
+        "prior_summary_overflow": prior_summary_overflow,
+        "recent_turns": {key: (preserve_info or {}).get(key, 0) for key in
+                         ("requestedRecentTurns", "availableRecentTurns", "retainedRecentTurns")},
+        "session_title": {"status": source_title["status"], "ambiguous_count": source_title["ambiguousCount"],
+                          "sha256": sha256_hex(title_value(projected_title).encode("utf-8")) if projected_title else None},
         "model_pack_estimated_tokens": model_pack_estimated_tokens,
         "model_pack_estimated_token_budget": model_pack_estimated_token_budget,
         "model_pack_evidence_truncated": model_pack_evidence_truncated,
@@ -8055,6 +8354,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Read and report strict resume topology for --input without generating packs, candidates, sidecars, or backups",
     )
     parser.add_argument("--validate-only", type=pathlib.Path, help="Validate one JSONL and exit without compression writes")
+    parser.add_argument("--preflight", action="store_true", help="Read-only topology, tool closure, partition and evidence capacity report")
+    parser.add_argument("--tool-evidence", choices=("excerpt", "full"), default="excerpt", help="Full preserves complete older tool payloads within unchanged pack ceilings")
+    parser.add_argument("--citation-style", choices=("legacy", "scoped"), default="legacy", help="Scoped prose uses [@L42] / [@H3], keeping document identifiers literal")
+    parser.add_argument("--prior-summary-overflow", choices=("fold", "error"), default="fold", help="Use error with verbatim to forbid fallback folding")
+    parser.add_argument("--min-recent-turns", type=int, default=0, help="Protect this many recent human-started turns in the current session after its last compact")
     return parser.parse_args(argv)
 
 
@@ -8102,12 +8406,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.backup_dir and not args.replace_original:
             raise ValueError("--backup-dir requires --replace-original")
         if not args.input or (not args.output and not args.replace_original):
-            if not (args.input and args.write_model_pack):
+            if not (args.input and (args.write_model_pack or args.preflight)):
                 raise ValueError("--input and --output are required unless --validate-only, --write-model-pack, or --replace-original is used")
         if not (0.05 <= args.target_ratio <= 0.95):
             raise ValueError("--target-ratio must be between 0.05 and 0.95")
         if args.target_estimated_tokens is not None and args.target_estimated_tokens < 1000:
             raise ValueError("--target-estimated-tokens must be at least 1000")
+        if args.min_recent_turns < 0:
+            raise ValueError("--min-recent-turns must be non-negative")
+        if args.min_recent_turns and args.preserve_physical_tail:
+            raise ValueError("--min-recent-turns requires strict active-chain mode")
+        if args.prior_summary_overflow == "error" and not args.preserve_prior_summaries_verbatim:
+            raise ValueError("--prior-summary-overflow error requires --preserve-prior-summaries-verbatim")
         if args.min_recent_records < 0:
             raise ValueError("--min-recent-records must be non-negative")
         require_summary_char_budget(args.summary_char_budget)
@@ -8138,6 +8448,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             summary_template_path=args.summary_template,
             strict=bool(args.importance_words or args.topic_patterns or args.summary_template),
         )
+        if args.preflight:
+            if any((args.output, args.write_model_pack, args.replace_original, args.model_summary, args.deterministic_summary)):
+                raise ValueError("--preflight is read-only and cannot be combined with output operations")
+            result = preflight_jsonl(args.input, args.target_ratio, args.min_recent_records, args.summary_char_budget,
+                preserve_active_chain=not args.preserve_physical_tail,
+                max_post_prompt_extension=args.max_post_last_prompt_extension,
+                max_file_history_snapshots=args.max_file_history_snapshots, checkpoint_policy=args.checkpoint_policy,
+                resume_leaf_override=args.resume_leaf, model_pack_char_budget=args.model_pack_char_budget,
+                model_pack_estimated_token_budget=args.model_pack_estimated_token_budget,
+                handoff_summary_path=args.handoff_summary, preserve_prior_summaries_verbatim=args.preserve_prior_summaries_verbatim,
+                target_estimated_tokens=args.target_estimated_tokens, tool_evidence=args.tool_evidence,
+                citation_style=args.citation_style, prior_summary_overflow=args.prior_summary_overflow,
+                min_recent_turns=args.min_recent_turns)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0 if result["ok"] else 2
         if args.write_model_pack:
             pack = build_model_summary_pack_for_input(
                 input_path=args.input,
@@ -8154,6 +8479,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 handoff_summary_path=args.handoff_summary,
                 preserve_prior_summaries_verbatim=args.preserve_prior_summaries_verbatim,
                 target_estimated_tokens=args.target_estimated_tokens,
+                tool_evidence=args.tool_evidence,
+                citation_style=args.citation_style,
+                prior_summary_overflow=args.prior_summary_overflow,
+                min_recent_turns=args.min_recent_turns,
             )
             write_model_summary_pack(args.write_model_pack, pack["text"])
             out = {
@@ -8210,6 +8539,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             checkpoint_policy=args.checkpoint_policy,
             resume_leaf_override=args.resume_leaf,
             target_estimated_tokens=args.target_estimated_tokens,
+            tool_evidence=args.tool_evidence,
+            citation_style=args.citation_style,
+            prior_summary_overflow=args.prior_summary_overflow,
+            min_recent_turns=args.min_recent_turns,
             write_sidecar_files=not replacing_original,
         )
         if replacing_original:

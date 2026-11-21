@@ -1,666 +1,82 @@
 # Claude JSONL Compressor
 
-[English](https://github.com/brandrylabs/claude-jsonl-compressor/blob/v1.1.0/README.md) | [简体中文](https://github.com/brandrylabs/claude-jsonl-compressor/blob/v1.1.0/docs/README.zh-CN.md) | [日本語](https://github.com/brandrylabs/claude-jsonl-compressor/blob/v1.1.0/docs/README.ja.md)
+[English](https://github.com/brandrylabs/claude-jsonl-compressor/blob/v1.2.0/README.md) | [简体中文](https://github.com/brandrylabs/claude-jsonl-compressor/blob/v1.2.0/docs/README.zh-CN.md) | [日本語](https://github.com/brandrylabs/claude-jsonl-compressor/blob/v1.2.0/docs/README.ja.md)
 
-Strict, model-assisted compression for one Claude Code session transcript, plus an independent byte-preserving compatibility repair for historical `Read.pages` records.
+Resume a long Claude Code session with less context to load and the reasoning behind your decisions close at hand. The summary follows the branch you kept after a rewind, carrying forward key quotations and open questions. Recent turns stay in their original form for `/rewind`, including tool calls and results.
 
-**Release:** [`1.1.0`](CHANGELOG.md)<br>
-**Engine:** `v10`<br>
-**Model-pack schema:** `v11`<br>
-**License:** GPL-3.0-only<br>
-**Repository:** [brandrylabs/claude-jsonl-compressor](https://github.com/brandrylabs/claude-jsonl-compressor)
+## Ask Codex
 
-This project is not affiliated with Anthropic. Claude Code's transcript JSONL is an observed internal format, not a published stable storage API. Always keep the original file or a verified backup.
+> Compress the session named “Exhibition plan” with v12. Keep the agreed budget, the artist’s exact wording, why we ruled out the other venues and which permissions we still need. Keep the last two turns I started, including their tool calls and results. Write a candidate file for me to review.
 
-## Version 1.1.0: bounded research evidence
+With the skill installed, Codex finds the session by its final title, writes and submits the summaries, and produces the candidate. Give the file path if two sessions share a title. On a later pass you can ask, “Keep the previous summary word for word and append what changed.”
 
-The goal is to reduce Claude context and cache costs without replacing them
-with unbounded summarizer work. The CLI keeps `excerpt`, `legacy`, `fold`, and
-zero protected human turns as compatible defaults. For new Codex workflows,
-use scoped citations; select full tool evidence when research lives in tool
-payloads. Run the same selection options in preflight and both passes:
+## Install
 
-```text
---preflight --tool-evidence full --citation-style scoped
---min-recent-turns 2
---preserve-prior-summaries-verbatim --prior-summary-overflow error
-```
-
-`--preflight` is read-only and replaces an output operation; the other flags
-are selection settings. It separates pointer topology from tool closure,
-reports a physical-tail candidate without selecting it, and checks the chosen
-pack against both existing ceilings. `nothing-to-summarize` needs no model work.
-Full evidence retains complete old active tool inputs/results and auxiliary
-results, including mixed prose/tool records and replacement characters. Exact
-long strings repeated within one record are referenced once. It does not merge
-near-duplicates, fetch external documents, or reconstruct unrecorded reasoning.
-An over-budget full pack stops; it never silently samples required payloads,
-raises the ceiling, launches more agents, or splits itself into volumes.
-
-`--citation-style scoped` uses `[@L42]` / `[@H3]` in summary prose; ordinary
-document labels such as L73/H1 remain literal. The mandatory coverage subsection
-keeps its printed L-prefix syntax. `--prior-summary-overflow error` requires
-verbatim preservation and refuses folding, including known impossible old-text
-size before model work. Pass 2 checks the actual new layer too. The legacy
-`fold` policy remains available. Exact old text includes trailing whitespace.
-
-`--min-recent-turns N` protects human-started turns after the latest compact
-and in the final session only. It may enlarge raw context and prevent meeting
-a token target; protection is never silently reduced. It is unsupported with
-physical-tail compatibility. Counts are structural, not a guarantee of rewind
-menu entries. File rewind still requires native checkpoints and their files;
-Bash changes cannot acquire checkpoints merely through JSONL compression.
-
-The final attributable custom title (or automatic title if none) is preserved,
-including a rename after the final pointer. Lookup shares that resolver and
-prefers exact path/ID matches over title scanning. Old names are not aliases.
-Unowned titles in mixed-session files are reported instead of guessed.
-
-After successful read-only preflight, make and verify a numbered source backup
-before semantic work; check its hash against preflight. Live replacement still
-creates its independent transaction backup. Default model work is one authored
-summary plus focused self-review. Explicit user requests for retrospective,
-independent, or subagent review are supported with their requested configuration.
-Review and cite relevant complete evidence; do not turn every run into repeated
-full-history review. Structural checks cannot establish semantic truth or actual
-Claude runtime compatibility. Engine v10 / model-pack v11 / report 1 remain;
-regenerate a two-pass pack after upgrading.
-
-
-## What It Does
-
-- Compresses one Claude Code JSONL into one current compact-style summary pair plus a recent raw active suffix.
-- Uses a model-authored semantic summary by default, with deterministic evidence selection and validation around it.
-- Excludes rewound/inactive branch text from every Claude-readable output layer.
-- Preserves recent conversation records for Claude rewind.
-- Projects one final `last-prompt` while retaining unknown source fields.
-- Validates UUIDs, parents, sessions, compact metadata and API-level tool pairing.
-- Supports candidate output and transactional replacement of one live `.claude/projects` session.
-- Handles repeated compression, including an explicit prior-summary verbatim mode.
-- Offers an independent byte-level repair that removes unsupported historical `Read.pages` members without reserializing the JSONL.
-- Runs with Python's standard library. No tokenizer or YAML dependency is required.
-
-## Quick Start
-
-With this repository installed as a Codex skill, ask Codex:
-
-```text
-Use the claude-jsonl-compressor skill on exactly one Claude Code JSONL.
-Input: C:\data\session.jsonl
-Output: C:\data\session.compressed.jsonl
-Target: about 150k estimated Messages tokens.
-Keep recent raw records for rewind, use the default model-assisted summary, and run validation.
-```
-
-For a live `.claude/projects` file, explicitly request a numbered backup and in-place replacement, confirm that the session is closed, and provide a work directory outside `.claude`. The detailed two-pass CLI workflow appears below.
-
-## Why Model-Assisted By Default
-
-Deterministic code can select topology and validate bytes, but it cannot decide which historical arguments, legal distinctions, design rationale or research conclusions matter. Python therefore freezes the active branch and builds a bounded, source-anchored evidence pack; a host model writes the summary; Python then verifies request/evidence digests, anchors, required source excerpts and the final JSONL.
-
-The script itself never calls a model or the network. The evidence pack bridges the practical 1M-session-versus-smaller-summarizer gap by including every non-empty older active human message and assistant `text`/`thinking` message in full while excluding inactive branches, recent raw records and low-value structural repetition. U+FFFD is reported without discarding the rest of a mandatory record. If mandatory evidence exceeds either pack ceiling, generation stops instead of sampling semantic history.
-
-## Safety Properties
-
-### Strict resume authority
-
-The physically last `type: "last-prompt"` record is authoritative in automatic mode. A malformed latest pointer is an error; the program does not search backward for an older valid pointer and accidentally revive an obsolete branch.
-
-Strict active mode rejects:
-
-- missing or malformed authority
-- missing leaf or parent
-- parent loops or malformed non-string/empty `parentUuid` values
-- ordinary-message/non-attachment physical parent inversion
-- recurring, pointer-mismatched or otherwise unsafe session lineage
-- duplicate UUIDs anywhere in the file
-- unsafe post-pointer extension
-
-Use `--resume-leaf UUID` only for an explicit recovery decision. It is reported as `active-chain-manual-override`, distinct from default strict `active-chain`. Use `--preserve-physical-tail` only as an explicit compatibility mode; it does not provide inactive-branch isolation.
-
-An unusual or ambiguous topology is a stop, not an automatic fallback. The CLI exits before creating a pack, candidate, report, backup or other sidecar. A hosting agent may explain one applicable explicit recovery control and ask the user to confirm it in a new instruction; it must not infer that confirmation from the original compression request. Manually spliced transcripts generally require physical-tail compatibility and therefore lose branch/rewind isolation.
-
-Current Claude Code reconstructs a conversation from a UUID map and parent links, so physical line order is not universally chronological. This project accepts only same-session `attachment -> attachment` physical inversions on an otherwise complete acyclic chain and writes them back in logical parent order. It also accepts one-way A->B (or A->B->C) session lineage only when a session never recurs and the final leaf and pointer match the final session. All earlier-session records become summary evidence; recent raw records remain entirely in the final session. A tool pair crossing that forced cut is a hard stop.
-
-### Rewound branches stay out
-
-The source indexes are partitioned into mutually exclusive sets:
-
-| Set | Meaning | May enter summary? | May remain raw? |
-| --- | --- | --- | --- |
-| `summaryIndexes` | Older active-chain records | Yes | No |
-| `rawKeepIndexes` | Recent active-chain records | No | Yes |
-| `sideKeepIndexes` | Policy-approved checkpoint side records | No | Side records only |
-| `controlProjectionIndexes` | Pointer and safe global control records | No | Projected only |
-| `excludedBranchIndexes` | Inactive UUID branches | No | No |
-| `excludedUnattributedIndexes` | Unattributed non-chain records | No | No |
-
-Excluded records appear in reports only as counts and digests. Their text is not copied into the model pack, compact summary, deterministic appendix, verbatim prior-summary block or output message chain.
-
-### Transactional writes
-
-- Input and candidate bytes are bound by full SHA-256; candidates are staged, flushed, validated and atomically published.
-- Numbered backups use exclusive creation and byte verification. Live replacement also captures and verifies the actual old target before installing the candidate.
-- Failed post-replacement validation restores the captured original. A rollback failure is raised prominently while verified recovery assets remain available.
-- Concurrent target recreation preserves the external target and recovery backups, then fails without publishing the candidate.
-- Parent-directory fsync is best effort and reported; this is not a cross-platform power-loss guarantee.
-- If the live JSONL commits but final report publication fails, the CLI does not undo valid committed data. It prints a `committed-report-failed` receipt with hashes and backup/candidate labels and exits with code 3.
-
-## Requirements
-
-- Python 3.10 or newer
-- Node.js 22 or newer only when using the npm command wrappers
-- Claude Code is optional; it is needed only for an explicitly requested runtime `/resume` or `/context` smoke test
-- Hard-link support on the volume holding the target file, and on an explicitly configured backup directory, for `--replace-original` only
-
-No Python package installation is required.
-
-### Hard-link requirement for live replacement
-
-`--replace-original` publishes the candidate with `os.link` so that it never overwrites a concurrent claimant, and the rollback path restores the captured original the same way. The target directory must therefore support file hard links. An explicitly supplied `--backup-dir` also publishes numbered backups with a hard link and must support the same operation.
-
-Before live replacement staging, backup payload publication, or target movement, the compressor runs a unique, same-directory hard-link probe on the target volume. The probe briefly creates two dot-prefixed temporary files and removes them; a cleanup failure is reported with the retained probe name and stops the live operation. If the capability probe fails, the target remains at its original path and byte content, and no live replacement stage, backup payload, or target move has started. This probe is a capability check, not a guarantee against a later permission, quota, network, or concurrency failure; late publication, rollback, and cleanup failures are reported with their transaction state and verified recovery assets.
-
-Each unique live-transaction temporary path is checked against its recorded filesystem identity and frozen bytes before cleanup. A detected mismatch is retained and reported as `committed-cleanup-failed` after a committed candidate, or alongside the primary failure before commit. Portable Python cannot bind the final pathname `unlink` atomically to that earlier identity check across Windows, Linux, and macOS. Run live replacement only with the session closed and no other writer; hostile same-account directory manipulation is outside this guarantee.
-
-NTFS, APFS, ext4, XFS, and btrfs commonly support file hard links, while FAT/exFAT, some network shares, overlay or bind-mounted filesystems, and Windows ReFS may reject them. The probe is authoritative for the actual directory and account; the filesystem name alone is not treated as a guarantee. The repository CI runs the probe and transaction tests on Windows, Linux, and macOS runner volumes.
-
-Candidate output is unaffected: it publishes through `os.replace` and has no hard-link dependency.
-
-## Installation
-
-### Install As A Codex Skill
-
-Clone the repository into the Codex skill directory:
-
-```bash
-skill="${CODEX_HOME:-$HOME/.codex}/skills/claude-jsonl-compressor"
-mkdir -p "$(dirname "$skill")"
-git clone https://github.com/brandrylabs/claude-jsonl-compressor.git "$skill"
-```
-
-Windows PowerShell:
+Use Python 3.10 or later. The npm commands require Node.js 22 or later.
 
 ```powershell
-$codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
-$skill = Join-Path $codexHome 'skills\claude-jsonl-compressor'
-New-Item -ItemType Directory -Force (Split-Path -Parent $skill) | Out-Null
-git clone https://github.com/brandrylabs/claude-jsonl-compressor.git $skill
+npm install --global @brandry/claude-jsonl-compressor@1.2.0
+claude-jsonl-compressor --version
+claude-jsonl-compressor v12 --help
 ```
 
-Update or uninstall the skill:
-
-```bash
-git -C "${CODEX_HOME:-$HOME/.codex}/skills/claude-jsonl-compressor" pull --ff-only
-rm -rf "${CODEX_HOME:-$HOME/.codex}/skills/claude-jsonl-compressor"
-```
+To add the installed package to Codex, run the following in PowerShell.
 
 ```powershell
-git -C $skill pull --ff-only
-Remove-Item -LiteralPath $skill -Recurse -Force
+$packagePath = Join-Path (npm root -g) '@brandry/claude-jsonl-compressor'
+$skillRoot = if ($env:CODEX_HOME) { Join-Path $env:CODEX_HOME 'skills' } else { Join-Path $env:USERPROFILE '.codex/skills' }
+$installed = Join-Path $skillRoot 'claude-jsonl-compressor'
+New-Item -ItemType Directory -Force -Path $installed | Out-Null
+Copy-Item -Path (Join-Path $packagePath '*') -Destination $installed -Recurse -Force
 ```
 
-The installed directory must contain `SKILL.md`, `scripts/`, `config/`, `templates/` and `references/`.
+On Linux or macOS, copy the package from `npm root -g` into `~/.codex/skills/claude-jsonl-compressor`, or into `skills/claude-jsonl-compressor` under your configured `CODEX_HOME`. The Python scripts run offline. You choose the model that reads the material. [License](LICENSE)
 
-### Install The npm CLI
+## Run v12 from the command line
 
-After version 1.1.0 is published:
-
-```bash
-npm install --global @brandry/claude-jsonl-compressor
-```
-
-This installs two commands:
-
-```text
-claude-jsonl-compressor
-claude-jsonl-repair-read-pages
-```
-
-The npm package is a zero-dependency Node shim over the bundled Python implementation. It forwards arguments, stdio, exit codes and signals with `shell: false`. The tarball also contains `SKILL.md`, `agents/` and `references/`, but npm installation does not register the directory as a Codex skill; skill installation remains a separate copy/link step.
-
-Upgrade or uninstall the global CLI:
-
-```bash
-npm install --global @brandry/claude-jsonl-compressor
-npm update --global @brandry/claude-jsonl-compressor
-npm uninstall --global @brandry/claude-jsonl-compressor
-```
-
-Local development install and invocation:
-
-```bash
-npm install --save-dev @brandry/claude-jsonl-compressor
-npm update @brandry/claude-jsonl-compressor
-npm exec -- claude-jsonl-compressor --version
-npm exec -- claude-jsonl-repair-read-pages --version
-npm uninstall @brandry/claude-jsonl-compressor
-```
-
-Run without retaining an installation:
-
-```bash
-npx --yes --package @brandry/claude-jsonl-compressor claude-jsonl-compressor --version
-npx --yes --package @brandry/claude-jsonl-compressor claude-jsonl-repair-read-pages --version
-```
-
-Actual npm/npx operations use the same Python CLI options:
-
-```bash
-npx --yes --package @brandry/claude-jsonl-compressor claude-jsonl-compressor --input session.jsonl --write-model-pack run/session.model-pack.md
-npx --yes --package @brandry/claude-jsonl-compressor claude-jsonl-repair-read-pages --input session.jsonl --scan-only
-```
-
-### Use From Source Without Installing
-
-```bash
-python scripts/compress_claude_jsonl.py --version
-python scripts/repair_claude_jsonl.py --version
-```
-
-### Can Claude Code Install This Skill?
-
-`SKILL.md` is a Codex skill definition, not a native Claude Code skill/plugin format. Claude Code can still run the Python or npm commands when instructed, but installing this directory into Claude's configuration does not automatically create an equivalent Claude-native skill.
-
-## Detailed Workflow
-
-The examples below use PowerShell and a local skill installation:
+**1. Plan and prepare.** Substitute your source path and a new run directory. This example targets 150,000 estimated tokens for the candidate and keeps at least two complete recent turns. The plan previews the retained history and writing tasks. Preparation backs up the source and writes a request for each task.
 
 ```powershell
-$skill = "$env:USERPROFILE\.codex\skills\claude-jsonl-compressor"
+claude-jsonl-compressor v12 plan --input "C:\data\session.jsonl" --min-recent-turns 2 --target-estimated-tokens 150000
+claude-jsonl-compressor v12 prepare --input "C:\data\session.jsonl" --min-recent-turns 2 --target-estimated-tokens 150000 --run "C:\work\first-run"
+claude-jsonl-compressor v12 status --run "C:\work\first-run"
 ```
 
-### 1. Analyze The Resume Path
+**2. Write and submit.** For each ID in `pending`, give a writing model the matching request (such as `map-001.md`) and the writing guide in a fresh context. Save its short Markdown draft with source tags. Compact models can follow the same steps. The script checks the draft and assembles the JSONL. [Writing guide](references/v12-memory.md)
 
 ```powershell
-python "$skill\scripts\compress_claude_jsonl.py" `
-  --input "C:\data\session.jsonl" `
-  --analyze-resume-path
+claude-jsonl-compressor v12 submit --run "C:\work\first-run" --task map-001 --draft "C:\work\draft.md"
+claude-jsonl-compressor v12 status --run "C:\work\first-run"
 ```
 
-This is read-only. A nonzero result must be resolved before model-pack generation.
-Use `reasonCode` for the exact machine-readable cause; `status` is only the
-coarse category. The stable value table is in
-[`references/claude-jsonl-compression-format.md`](references/claude-jsonl-compression-format.md#authoritative-last-prompt).
+Repeat with the IDs returned by `status`, including any merge task (Reduce). The merge reconciles current decisions with the ones they replace. If a draft fails a check, correct that draft and submit it again.
 
-### 2. Generate A Model Evidence Pack
+**3. Create the candidate.** When `pending` is empty and `finalJob` names the accepted task, run the following command. The run directory now contains `candidate.jsonl` for the next conversation, alongside separate evidence, receipts and cost estimates.
 
 ```powershell
-python "$skill\scripts\compress_claude_jsonl.py" `
-  --input "C:\data\session.jsonl" `
-  --write-model-pack "C:\work\run\session.model-pack.md" `
-  --target-ratio 0.30 `
-  --min-recent-records 120 `
-  --summary-char-budget 60000 `
-  --target-estimated-tokens 150000 `
-  --model-pack-char-budget 500000 `
-  --model-pack-estimated-token-budget 150000
+claude-jsonl-compressor v12 finish --run "C:\work\first-run"
 ```
 
-The evidence pack has two independent default ceilings: 500,000 characters
-and a conservative 150,000-token local estimate. The token ceiling leaves
-working room in a typical 200k summarizer context. Mandatory human/assistant
-semantic records, prior compact summaries, handoff lines, and required coverage
-groups are never sampled or clipped; generation stops if they do not fit.
-Optional source/tool/system/error evidence is added by importance and chronology
-until either ceiling is reached, and the pack/report state whether that optional
-evidence was truncated. Do not install a tokenizer to change this workflow.
+### What to carry forward
 
-`--target-ratio` is an approximate byte-ratio planning input, not a hard release gate. For a hard local Messages estimate ceiling, use:
+| Option | Use it to… |
+|---|---|
+| `--prior resynthesize` | Combine old and new evidence into a fresh summary. This is the v12 default. |
+| `--prior verbatim-locked` | Keep the entire earlier summary word for word, including whitespace, and append new work. |
+| `--prior clean-and-merge` | Review the earlier summary and its unique quotations, then merge what still matters. |
+| `--min-recent-turns N` | Keep at least N complete turns started by the user, with their tool calls and results. |
+| `--media archive` | With the user’s permission, mark unread media and keep the original in the backup. |
 
-```powershell
-  --target-estimated-tokens 150000
-```
+A revised budget can carry both figures, their units and the date the new amount takes effect. A permission can name who granted it, to whom and on what terms. Contract clauses and research notes can carry exact quotations with line ranges. Adjacent passages from the same source can share an attribution. [Source excerpts](references/v12-excerpts.md)
 
-This candidate-output estimate is separate from the model-pack reading ceiling.
-It covers complete retained structured message payloads, including full thinking,
-`tool_use.input`, `tool_result`, and `toolUseResult` data. It does not include
-Claude's system prompt, tool schemas, MCP servers, agents, skills, memory files
-or runtime-loaded context. It is not a promise about total `/context` usage.
+## Backups and recovery
 
-`--summary-char-budget` has a hard minimum of 4000 characters. A smaller value or a blank compact summary is rejected instead of publishing unusable memory.
+The candidate leaves the original file in place. Preparation puts `session.jsonl.backup` beside it, or `session.jsonl.backup1` if the first name is taken. To replace a live session, close it and request replacement explicitly. File rewind uses the Claude file-history snapshots associated with retained turns. Recovery can identify the final reply of a completed tool turn even when an attachment follows it. Mixed text and media results retain readable text and captions.
 
-### 3. Write The Model Summary
+The v11 two-pass CLI is also available. Use the same selection settings for both passes and prepare a fresh pack after upgrading. Set its evidence limit with `--model-pack-estimated-token-budget`.
 
-The model reads the pack and writes `session.model-summary.md`.
-
-The first HTML comment must be copied exactly and contains:
-
-```text
-source_sha256
-summary_source_sha256
-evidence_anchor_lines_digest
-required_anchor_groups_digest
-handoff_summary_digest
-pack_request_digest
-required_claim_sources_digest
-```
-
-Every substantive transcript claim needs a displayed `L<number>` anchor. Every external-handoff claim needs a displayed `H<number>` anchor. The validator rejects invented or hidden anchors. It also requires at least one cited anchor from every generated coverage group and an anchored body under each of the nine exact headings printed in the pack. Only the exact leading metadata comment and exact required headings are exempt from line grounding; extra HTML comments or headings are errors. The exact whole line `Unknown from provided anchors.` is the only unanchored uncertainty placeholder; adding other text to that line removes the exemption.
-
-Schema v11 assigns a required full-text L-anchor group to every non-empty older active human message and every older active assistant `text`/`thinking` message. It binds every selection/resource option through `pack_request_digest`. Under the exact `### Mandatory Evidence Coverage` subsection, the model must provide exactly one line per mandatory semantic/prior-summary record:
-
-```text
-- L42 support_text_json="exact source substring" disposition=covered
-```
-
-The JSON string must decode to a meaningful exact substring of that L record. This mechanical gate blocks anchor-only boilerplate and leaves a checkable source excerpt; it does not prove that all natural-language interpretation is correct. Schema v11 also reserves early/middle/late/latest, source/tool and prior-summary coverage. Prior compact summaries and every physical line of an explicitly supplied handoff enter the pack in full; handoff early/middle/late/latest H groups must be cited. Pack generation stops instead of truncating or sampling mandatory evidence when either the character or estimated-token ceiling is insufficient. Raise `--model-pack-char-budget` or `--model-pack-estimated-token-budget` only when the summarizing model can read the resulting pack.
-
-The summary should preserve:
-
-- current state
-- chronology and supersessions
-- user constraints and wording
-- assistant/model research decisions and reasons
-- evidence provenance
-- rejected alternatives
-- risks, unknowns and follow-ups
-- recent raw boundary
-
-Later events control current state, but earlier decisions and their reasons remain as superseded history.
-
-### 4. Build A Candidate
-
-```powershell
-python "$skill\scripts\compress_claude_jsonl.py" `
-  --input "C:\data\session.jsonl" `
-  --output "C:\data\session.compressed.jsonl" `
-  --target-ratio 0.30 `
-  --min-recent-records 120 `
-  --summary-char-budget 60000 `
-  --target-estimated-tokens 150000 `
-  --model-pack-char-budget 500000 `
-  --model-pack-estimated-token-budget 150000 `
-  --model-summary "C:\work\run\session.model-summary.md"
-```
-
-Pass exactly the same selection options used for the model pack. In particular,
-repeat both non-default model-pack ceilings so the second pass regenerates the
-same evidence contract.
-
-The command writes:
-
-```text
-session.compressed.jsonl
-session.compressed.jsonl.validation.json
-session.compressed.jsonl.report.md
-```
-
-The input remains unchanged.
-
-## Live Session Replacement
-
-Close the Claude Code process using that session before replacement. The live target must be an existing regular `.jsonl` file under `.claude/projects`.
-
-Generate the model pack and model summary outside `.claude`, then run:
-
-```powershell
-python "$skill\scripts\compress_claude_jsonl.py" `
-  --input "$env:USERPROFILE\.claude\projects\PROJECT\SESSION.jsonl" `
-  --replace-original `
-  --confirm-session-closed `
-  --work-dir "C:\work\claude-compression\SESSION-TIMESTAMP" `
-  --model-pack-estimated-token-budget 150000 `
-  --target-estimated-tokens 150000 `
-  --model-summary "C:\work\claude-compression\SESSION-TIMESTAMP\session.model-summary.md"
-```
-
-The default backup is placed beside the live file:
-
-```text
-SESSION.jsonl.backup
-SESSION.jsonl.backup1
-SESSION.jsonl.backup2
-```
-
-To keep backups outside `.claude`:
-
-```powershell
-  --backup-dir "C:\work\claude-compression\SESSION-TIMESTAMP\backups"
-```
-
-Candidate, report, validation, model pack and model summary files remain under the external work directory. Do not manually copy a refused candidate over a live session. Exit code 3 with `committed-report-failed` means the live JSONL was already replaced and validated but final report publication failed; inspect the printed hashes and numbered backup instead of rerunning blindly.
-
-## Checkpoint And Rewind Behavior
-
-Conversation rewind and file rewind are separate mechanisms.
-
-Default:
-
-```text
---checkpoint-policy active-correlated
-```
-
-It retains only UUID-less `file-history-snapshot` records with structural identifiers that correlate to recent retained active records.
-
-Other controls:
-
-```text
---checkpoint-policy none
---max-file-history-snapshots N
-```
-
-`--checkpoint-policy preserve-recent` is rejected in strict active-chain mode. It is available only together with explicit `--preserve-physical-tail`, which is labeled compatibility mode and does not isolate rewound branches. JSONL compression alone does not guarantee complete file-state rewind.
-
-## Repeated Compression
-
-The default behavior folds previous compact summaries into one new current summary. Old decisions must be checked against later supersessions; old summary text is not automatically current truth.
-
-An older Codex compact boundary may retain a `preservedMessages` snapshot from the time it was created. If a later rewind diverges from that snapshot, source validation reports a historical-snapshot warning and follows only the current authoritative parent chain; the rewound tail stays excluded. Every newly generated candidate must rebuild this metadata to match its current chain exactly.
-
-For an explicit exact-text request:
-
-```text
---preserve-prior-summaries-verbatim --prior-summary-overflow error
-```
-
-Use both flags in both passes. The compressor allows up to 1.5 times the configured summary character budget and stops if strict exact preservation cannot fit. Omitting the overflow flag retains the legacy `fold` behavior: an oversized block reports `fallback-folded` and uses normal semantic folding. It never leaves stacked old compact pairs on the current active chain.
-
-## Deterministic Fallback
-
-Model-assisted summary is the default. Use deterministic fallback only on explicit request:
-
-```powershell
-python "$skill\scripts\compress_claude_jsonl.py" `
-  --input "C:\data\session.jsonl" `
-  --output "C:\data\session.compressed.jsonl" `
-  --deterministic-summary
-```
-
-The CLI otherwise requires `--model-summary`.
-
-## Read.pages Compatibility Repair
-
-Claude's native Read tool can legitimately use `pages` for long PDFs. This repair exists for a separate compatibility failure where a historical bridge cannot accept that member. Compression never runs it automatically.
-
-### Scan
-
-```powershell
-python "$skill\scripts\repair_claude_jsonl.py" `
-  --input "C:\data\session.jsonl" `
-  --scan-only
-```
-
-### Write A Candidate
-
-```powershell
-python "$skill\scripts\repair_claude_jsonl.py" `
-  --input "C:\data\session.jsonl" `
-  --output "C:\data\session.repaired.jsonl" `
-  --expect-matches 2
-```
-
-### Replace One Live File
-
-```powershell
-python "$skill\scripts\repair_claude_jsonl.py" `
-  --input "$env:USERPROFILE\.claude\projects\PROJECT\SESSION.jsonl" `
-  --replace-original `
-  --confirm-session-closed `
-  --work-dir "C:\work\claude-repair\SESSION-TIMESTAMP" `
-  --expect-matches 2
-```
-
-Default scope is the strict active chain. `--scope all` must be explicit.
-
-The repair requires:
-
-- assistant API message
-- structured `tool_use`
-- exact tool name `Read`
-- object `input`
-- present `pages` member
-- non-empty `file_path`
-- exactly one later matching `tool_result` in scope
-- the same non-empty `sessionId` on use and result
-- result `sourceToolAssistantUUID` equal to the tool-use assistant UUID
-
-Pending calls and near matches are reported but unchanged. Duplicate JSON keys or ambiguous spans stop the run before editing. Candidate publication re-reads the actual published bytes, binds them to the expected SHA-256, validates the repair plan, requires an idempotent second scan, and runs the shared full-transcript UUID/parent/compact/tool validator. Exit code 3 with `operationState: committed-report-failed` has the same already-committed meaning as live compression.
-
-## CLI Reference
-
-Important compression options:
-
-| Option | Purpose |
-| --- | --- |
-| `--analyze-resume-path` | Read-only strict topology report |
-| `--write-model-pack PATH` | Write bounded semantic evidence and stop |
-| `--model-summary PATH` | Validate and embed model-authored summary |
-| `--deterministic-summary` | Explicit model opt-out |
-| `--target-ratio R` | Approximate output byte-ratio planning value; not a hard gate |
-| `--target-estimated-tokens N` | Hard ceiling under the local complete-structure Messages estimate |
-| `--min-recent-records N` | Raw active-suffix floor |
-| `--summary-char-budget N` | Compact-summary character budget; minimum 4000 |
-| `--model-pack-char-budget N` | Evidence-pack character budget |
-| `--model-pack-estimated-token-budget N` | Evidence-pack local token estimate ceiling; default 150000 |
-| `--resume-leaf UUID` | Explicit recovery leaf override |
-| `--max-post-last-prompt-extension N` | Explicit complete tool-result-only closure limit; default 0 |
-| `--checkpoint-policy POLICY` | Strict mode: `active-correlated` or `none`; `preserve-recent` only with physical-tail compatibility |
-| `--preserve-prior-summaries-verbatim` | Explicit repeated-compression exact-text mode |
-| `--preserve-physical-tail` | Compatibility mode without branch-isolation guarantee |
-| `--replace-original` | Transactionally replace one live session |
-| `--confirm-session-closed` | Required caller acknowledgement for live replacement; not process-lock detection |
-| `--work-dir PATH` | External process directory for live replacement |
-| `--backup-dir PATH` | Optional external backup directory |
-| `--validate-only PATH` | Structural validation only |
-
-Run `--help` for the complete list.
-
-## Validation Scope
-
-The validator checks:
-
-- JSON object per non-empty line
-- UUID uniqueness
-- parent existence and session consistency
-- final pointer target
-- active chain closure
-- narrow attachment-order and one-way session-lineage compatibility, with unsafe variants rejected
-- one current compact boundary and compact summary
-- compact metadata consistency
-- merged assistant fragments and split user tool results
-- API-level `tool_use` / `tool_result` order and pairing
-- non-empty, unique active tool IDs; partial multi-tool ordered subsets remain a reported branch-compatibility warning
-- absence of internal scratch fields
-
-Validation checks internal consistency under the observed-format rules; Claude Code versions may still build runtime context differently.
-
-When runtime testing is explicitly allowed, check these separately:
-
-1. `/resume` lists and opens the session.
-2. `/context` shows expected Messages usage.
-3. Recent conversation rewind works.
-4. Recent file rewind works for retained checkpoints.
-
-High total `/context` with low Messages can come from system prompt, tools, MCP, agents, skills, memory files or newly read content. Recompressing JSONL does not reduce those categories.
-
-## Session Locator
-
-Locate exactly one file by filename or session ID without reading transcript bodies:
-
-```powershell
-python "$skill\scripts\claude_session_tools.py" `
-  --root "$env:USERPROFILE\.claude\projects" `
-  --query "SESSION.jsonl"
-```
-
-`--scan-titles` reads candidate files only when title matching is explicitly needed. Multiple matches are an error. The compressor never performs directory-wide multi-session compression.
-
-## Development And Verification
-
-Run the complete standard-library suite:
-
-```bash
-python -B -m unittest discover -s tests -v
-python -B tests/test_compressor.py
-python -B tests/test_repair.py
-python -B tests/test_package.py
-python -B tests/test_transaction_races.py
-python -B tests/test_semantic_evidence_contracts.py
-python -B tests/test_structural_safety_contracts.py
-python -B tests/test_protocol_contracts.py
-```
-
-Additional release checks:
-
-```bash
-pycache="$(mktemp -d)"
-if ! PYTHONPYCACHEPREFIX="$pycache" python -m compileall -q scripts tests; then
-  rm -rf "$pycache"
-  exit 1
-fi
-rm -rf "$pycache"
-python -B -I -S scripts/compress_claude_jsonl.py --version
-python -B -I -S scripts/repair_claude_jsonl.py --version
-npm test
-npm pack --dry-run --json
-npm publish --dry-run --access public --tag latest
-```
-
-The release suite covers active/dead branch partitioning, fixed-seed topology transformations, strict pointer failures, dual model-pack budgets, complete structured token accounting, multilingual semantic ledgers and thinking, handoffs, request/claim digests, mandatory support excerpts, tool pairs, repeated compression, checkpoint policies, transaction races and committed-report states, exact byte repair, BOM/CRLF, npm tarball allowlisting and offline tarball installation.
-
-### Maintainer Stable Release Checklist
-
-1. Confirm a clean public tree and matching `1.1.0` values in `package.json`, Python version output, docs, and tests.
-2. Run the Python, npm, isolated-Python, tarball, privacy, and offline-install gates above.
-3. Inspect `npm pack --dry-run --json`; publish only the allowlisted files.
-4. Require a clean worktree, create annotated tag `v1.1.0`, and push the commit and tag.
-5. Publish from an authenticated maintainer environment with permission to publish this package:
-
-```bash
-npm publish --access public --tag latest
-```
-
-6. Verify npm version `1.1.0` and the `latest` dist-tag, then create a GitHub release (not a prerelease) from the already-pushed tag.
-
-Do not append `--provenance` to a local publish. npm provenance requires a supported cloud CI runner. For later releases, prefer npm trusted publishing from a public GitHub repository on a GitHub-hosted runner with `id-token: write`, a protected release tag, and a matching protected environment; trusted publishing generates provenance automatically.
-
-Registry ownership, npm trusted-publisher configuration, credentials, tag push, GitHub prerelease creation, and npm publication are external maintainer actions and are not claimed by the local test suite.
-
-## Repository Layout
-
-```text
-SKILL.md
-CHANGELOG.md
-README.md
-LICENSE
-package.json
-bin/
-config/
-scripts/
-templates/
-references/
-tests/
-```
-
-## Privacy
-
-- The public project contains only anonymous synthetic fixtures.
-- Model packs and candidate metadata use generic labels such as `SOURCE_JSONL`; generated reports expose basenames, never full local paths.
-- npm publication uses an extension-level file allowlist.
-- JSONL, backups, reports, model packs, model summaries, caches and compiled Python files are excluded from the package.
-- Review generated evidence packs before sharing them; they intentionally contain selected transcript evidence.
-
-## License
-
-GPL-3.0-only. You may use, study, modify and redistribute the project under the GPL terms. Distribution of modified or incorporated versions may require corresponding source and the same license; review the license when integrating it into a distributed commercial product.
+- [Skill instructions and v11 commands](SKILL.md)
+- [v12 commands, budgets and recovery](references/v12-workflow.md)
+- [Memory writing and migration](references/v12-memory.md)
+- [JSONL structure, repair and transactions](references/claude-jsonl-compression-format.md)
+- [Release history](CHANGELOG.md)

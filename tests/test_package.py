@@ -182,7 +182,7 @@ class TestNpmPackage(unittest.TestCase):
     def test_manifest_has_no_runtime_dependencies_or_install_hooks(self):
         manifest = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["name"], "@brandry/claude-jsonl-compressor")
-        self.assertEqual(manifest["version"], "1.1.0")
+        self.assertEqual(manifest["version"], "1.2.0")
         self.assertEqual(manifest["publishConfig"]["tag"], "latest")
         self.assertEqual(manifest["license"], "GPL-3.0-only")
         self.assertEqual(manifest["engines"]["node"], ">=22")
@@ -263,7 +263,7 @@ class TestNpmPackage(unittest.TestCase):
             self.assertIn("model-pack-estimated-token-budget", text, relative)
 
     def test_public_two_pass_examples_bind_the_candidate_token_target(self):
-        for relative in ("README.md", "SKILL.md"):
+        for relative in ("SKILL.md",):
             blocks = powershell_blocks((ROOT / relative).read_text(encoding="utf-8"))
             model_passes = [
                 block for block in blocks
@@ -276,11 +276,11 @@ class TestNpmPackage(unittest.TestCase):
 
     def test_release_guidance_separates_local_publish_from_ci_provenance(self):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn("npm publish --access public --tag latest", readme)
-        self.assertIn("npm publish --dry-run --access public --tag latest", readme)
-        self.assertNotIn("npm publish --access public --tag latest --provenance", readme)
-        self.assertIn("supported cloud CI", readme)
-        self.assertIn("id-token: write", readme)
+        self.assertIn("v12 prepare", readme)
+        self.assertIn("v12 finish", readme)
+        for process_doc in ("references/v12-workflow.md", "references/v12-memory.md", "SKILL.md"):
+            self.assertTrue((ROOT / process_doc).is_file())
+            self.assertIn(process_doc, readme)
         self.assertIn("$env:CODEX_HOME", readme)
         self.assertIn("New-Item -ItemType Directory -Force", readme)
 
@@ -321,6 +321,13 @@ class TestNpmPackage(unittest.TestCase):
                 "test_transaction_races.py",
                 "test_semantic_evidence_contracts.py",
                 "test_structural_safety_contracts.py",
+                "test_v120_g1.py",
+                "test_v12_claims.py",
+                "test_v12_excerpts.py",
+                "test_v12_memory.py",
+                "test_v12_migration_flow.py",
+                "test_v12_payloads.py",
+                "test_v12_workflow.py",
             },
         )
 
@@ -343,7 +350,7 @@ class TestNpmPackage(unittest.TestCase):
         self.assertEqual(json.loads(node_version.stdout), json.loads(python_version.stdout))
         self.assertEqual(json.loads(python_version.stdout)["defaultModelPackEstimatedTokenBudget"], 150000)
         repair_data = json.loads(repair_version.stdout)
-        self.assertEqual(repair_data["packageVersion"], "1.1.0")
+        self.assertEqual(repair_data["packageVersion"], "1.2.0")
         self.assertEqual(repair_data["engineVersion"], "v10")
         self.assertEqual(repair_data["reportSchemaVersion"], 1)
 
@@ -352,7 +359,7 @@ class TestNpmPackage(unittest.TestCase):
             result = run(sys.executable, "-B", "-I", "-S", str(ROOT / "scripts" / script), "--version")
             self.assertEqual(result.returncode, 0, result.stderr)
             data = json.loads(result.stdout)
-            self.assertEqual(data["packageVersion"], "1.1.0")
+            self.assertEqual(data["packageVersion"], "1.2.0")
             self.assertEqual(data["engineVersion"], "v10")
 
     def test_real_npm_tarball_matches_public_allowlist_and_installs_offline(self):
@@ -421,7 +428,7 @@ class TestNpmPackage(unittest.TestCase):
                 else:
                     invoked = run(str(executable), "--version", cwd=tmp)
                 self.assertEqual(invoked.returncode, 0, invoked.stderr)
-                self.assertEqual(json.loads(invoked.stdout)["packageVersion"], "1.1.0")
+                self.assertEqual(json.loads(invoked.stdout)["packageVersion"], "1.2.0")
 
 
 if __name__ == "__main__":

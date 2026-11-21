@@ -2,6 +2,24 @@
 
 Notable public changes are recorded here. This project follows Semantic Versioning.
 
+## [Unreleased]
+
+## [1.2.0] - 2026-11-21
+
+### Added
+
+- Add the `v12` subcommand to summarize long sessions in sections and bring their decisions, evidence and open questions into one shorter session. An individual section can be retried on its own.
+- Keep an earlier summary word for word and append new work, or merge it with later decisions. Selected quotations keep their source and line range across compressions.
+- Show how much recent history the session will retain, estimate the size of the result and compare cache costs under different reuse assumptions.
+
+### Fixed
+
+- Preserve readable text, captions and line breaks when a tool returns both text and media. Mark unread media in the summary.
+- Recognize a completed tool turn when an attachment follows its final reply. Improve session lookup after a rename and support custom Claude configuration directories.
+- Catch swapped figures, changed units and mismatched permissions when checking a draft against its sources.
+- Check input and output budgets before reviewing quotations from earlier summaries. Split large reviews into tasks that fit.
+- Reject conflicting input, output and backup paths before writing.
+
 ## [1.1.0] - 2026-09-17
 
 - Add read-only `--preflight` with separate topology, tool closure, partition,
@@ -18,8 +36,6 @@ Notable public changes are recorded here. This project follows Semantic Versioni
 - Shorten skill instructions and make additional model review opt-in or driven
   by a concrete unresolved issue; honor explicit user review requirements.
 
-
-## [Unreleased]
 
 ## [1.0.0] - 2026-08-11
 
@@ -68,6 +84,8 @@ Initial public release candidate.
 - Live replacement handles one closed session at a time and requires Python 3.10 or newer.
 - Parent-directory durability is best effort where the platform does not support directory fsync.
 
-[Unreleased]: https://github.com/brandrylabs/claude-jsonl-compressor/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/brandrylabs/claude-jsonl-compressor/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/brandrylabs/claude-jsonl-compressor/releases/tag/v1.2.0
+[1.1.0]: https://github.com/brandrylabs/claude-jsonl-compressor/releases/tag/v1.1.0
 [1.0.0]: https://github.com/brandrylabs/claude-jsonl-compressor/releases/tag/v1.0.0
 [1.0.0-rc.1]: https://github.com/brandrylabs/claude-jsonl-compressor/releases/tag/v1.0.0-rc.1

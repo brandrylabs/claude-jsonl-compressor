@@ -56,16 +56,22 @@ def warn_if_python_too_old() -> Optional[str]:
 warn_if_python_too_old()
 
 
+def resolve_claude_config_root() -> pathlib.Path:
+    override = os.environ.get("CLAUDE_CONFIG_DIR")
+    return (pathlib.Path(override).expanduser() if override else pathlib.Path.home() / ".claude").resolve()
+
+
 def read_jsonl_records(path: pathlib.Path) -> List[Dict[str, Any]]:
     records: List[Dict[str, Any]] = []
-    with path.open("r", encoding="utf-8-sig", errors="replace") as f:
+    with path.open("r", encoding="utf-8-sig") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             obj = json.loads(line)
-            if isinstance(obj, dict):
-                records.append(obj)
+            if not isinstance(obj, dict):
+                raise ValueError("expected a JSON object")
+            records.append(obj)
     return records
 
 
@@ -91,6 +97,8 @@ def list_session_files(root: pathlib.Path) -> List[pathlib.Path]:
             continue
         safe_dirs: List[str] = []
         for name in dir_names:
+            if name.casefold() == "subagents":
+                continue
             child = directory / name
             try:
                 resolved = child.resolve()
@@ -193,8 +201,8 @@ def select_session_title(records: Sequence[Dict[str, Any]], session_id: Optional
 def extract_hint(path: pathlib.Path) -> str:
     try:
         records = read_jsonl_records(path)
-    except Exception:
-        return ""
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"title scan incomplete at {path.name}: {type(exc).__name__}") from exc
     return title_value(select_session_title(records).get("record") or {}).strip()
 
 
@@ -265,7 +273,14 @@ def find_unique_session(root: pathlib.Path, query: str, scan_titles: bool = Fals
     files = list_session_files(root)
     candidates = [path for path in files if _path_query_match(root, path, query)]
     if not candidates and scan_titles:
-        candidates = [path for path in files if query.lower() in extract_hint(path).lower()]
+        titles = [(path, extract_hint(path).casefold()) for path in files]
+        candidates = [path for path, title in titles if title and query.casefold() == title]
+        if not candidates:
+            partial = [path for path, title in titles if query and query.casefold() in title]
+            if partial:
+                labels = "\n".join(_candidate_label(root, p) for p in partial[:20])
+                detail = "multiple sessions" if len(partial) > 1 else "one possible session"
+                raise RuntimeError(f"partial title matches {detail}; select an exact title or path:\n" + labels)
     if not candidates:
         raise FileNotFoundError(f"no session matches {query!r} under {root}")
     if len(candidates) > 1:
@@ -279,7 +294,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         prog="claude-session-tools",
         description="Locate exactly one Claude Code session JSONL and optionally create a verified numbered backup.",
     )
-    parser.add_argument("--root", type=pathlib.Path, required=True, help="Root .claude/projects directory")
+    parser.add_argument("--root", type=pathlib.Path, default=resolve_claude_config_root() / "projects",
+                        help="Projects directory (default: projects under the Claude configuration root)")
     parser.add_argument("--query", required=True, help="Exact session id, filename, relative/absolute path, or title substring when --scan-titles is set")
     parser.add_argument(
         "--scan-titles",

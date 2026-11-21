@@ -1,7 +1,7 @@
 # Claude Code JSONL Compression Format Notes
 
 This document describes the empirical format handled by
-`@brandry/claude-jsonl-compressor` package `1.1.0` and engine `v10`.
+`@brandry/claude-jsonl-compressor` package `1.2.0` and engine `v10`. For v12 requests, source maps, migration and run receipts see [v12 workflow](v12-workflow.md) and [v12 memory](v12-memory.md).
 
 Claude Code transcript JSONL is an observed internal format, not a published
 stable storage API. The rules below are deliberately strict where ambiguity
@@ -10,13 +10,14 @@ incoherent.
 
 ## Version Domains
 
-The project keeps four independent version domains:
+These versions identify different parts of the release.
 
 | Domain | Current value | Meaning |
 | --- | --- | --- |
-| Package | `1.1.0` | GitHub/npm release version |
+| Package | `1.2.0` | GitHub/npm release version |
 | Compression engine | `v10` | Topology, partition, and rewrite behavior |
-| Model-pack schema | `v11` | Evidence-pack and model-summary binding protocol |
+| Legacy model-pack schema | `v11` | Evidence-pack and model-summary binding protocol |
+| v12 workflow schema | `v12.2` | Format of a prepared v12 run and its task records |
 | Report schema | `1` | Compression and repair report fields |
 
 A change to one domain does not imply the other domains changed.
@@ -620,6 +621,8 @@ metadata, not conversation evidence. Selected metadata retains unknown fields
 and is assigned the output session ID. Prior title projections are removed,
 and the final title is written before the sole final last-prompt. Ambiguous
 unowned titles are counted, never used to override a known owner.
+
+For recovery diagnostics a same-session attachment or turn-duration record may follow the end of a closed tool turn. The candidate lists the API endpoint and reports the trailing metadata separately. Selecting an endpoint still requires one closed continuation from the authoritative pointer and no later human prompt.
 
 Preflight is read-only. Its topology, activeChain, partition, estimates and pack
 fields separate structural validity, selected-source validation and capacity.

@@ -22,7 +22,7 @@ import re
 import sys
 import unicodedata
 import uuid
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Collection, Dict, Iterable, List, Optional, Sequence, Tuple
 
 # Python -I omits the script directory. Import only the bundled sibling, never
 # a cwd/site-package module with the same name.
@@ -34,11 +34,12 @@ if _session_tools_spec is None or _session_tools_spec.loader is None:
 _session_tools = importlib.util.module_from_spec(_session_tools_spec)
 _session_tools_spec.loader.exec_module(_session_tools)
 select_session_title = _session_tools.select_session_title
+resolve_claude_config_root = _session_tools.resolve_claude_config_root
 title_value = _session_tools.title_value
 
 
 JsonObj = Dict[str, Any]
-PACKAGE_VERSION = "1.1.0"
+PACKAGE_VERSION = "1.2.0"
 CODEX_OFFLINE_COMPRESSION_VERSION = "v10"
 MODEL_PACK_SCHEMA_VERSION = 11
 REPORT_SCHEMA_VERSION = 1
@@ -1950,7 +1951,7 @@ def publish_validated_jsonl(path: pathlib.Path, records: Sequence[JsonObj]) -> D
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = path.with_name(f".{path.name}.candidate-{uuid.uuid4().hex}.jsonl")
     candidate_bytes = jsonl_bytes(records)
-    validation = validate_jsonl_bytes(candidate_bytes, source_label=path.name)
+    validation = validate_jsonl_bytes(candidate_bytes, source_label=path.name, contract="fresh-candidate")
     if not validation.get("ok"):
         raise ValueError(f"generated candidate validation failed before publication: {validation.get('errors')}")
     if (
@@ -2269,14 +2270,17 @@ def _replace_file_after_validation(
     backup_dir: Optional[pathlib.Path] = None,
     expected_source_sha256: Optional[str] = None,
     expected_candidate_sha256: Optional[str] = None,
+    frozen_backup: Optional[Tuple[pathlib.Path, int, int]] = None,
+    validation_contract: str = "historical-source",
 ) -> Dict[str, Any]:
     # Low-level helper. Public live-session replacement must go through CLI
     # --replace-original so .claude scope, work-dir, and concurrency guards run.
+    guard_artifact_roles(target_path, candidate_path, backup_dir=backup_dir)
     candidate_bytes = candidate_path.read_bytes()
     candidate_sha256 = sha256_hex(candidate_bytes)
     if expected_candidate_sha256 is not None and candidate_sha256 != expected_candidate_sha256:
         raise RuntimeError("candidate JSONL changed after validation; original file was not replaced")
-    validation = validate_jsonl_bytes(candidate_bytes, source_label=candidate_path.name)
+    validation = validate_jsonl_bytes(candidate_bytes, source_label=candidate_path.name, contract=validation_contract)
     if not validation.get("ok"):
         raise ValueError(f"candidate validation failed; original file was not replaced: {validation.get('errors')}")
     source_bytes = target_path.read_bytes()
@@ -2313,7 +2317,15 @@ def _replace_file_after_validation(
         tmp_replace_expected_bytes = candidate_bytes
         if target_path.read_bytes() != source_bytes:
             raise RuntimeError("input JSONL changed before backup; original file was not replaced")
-        backup = _exclusive_backup_from_bytes(target_path, source_bytes, backup_dir=backup_dir)
+        if frozen_backup is None:
+            backup = _exclusive_backup_from_bytes(target_path, source_bytes, backup_dir=backup_dir)
+        else:
+            path, device, inode = frozen_backup
+            stat = path.lstat()
+            if (path.is_symlink() or (stat.st_dev, stat.st_ino) != (device, inode)
+                    or os.path.samefile(path, target_path) or path.read_bytes() != source_bytes):
+                raise RuntimeError("frozen run backup changed before replacement")
+            backup = path
         if target_path.read_bytes() != source_bytes:
             raise RuntimeError("input JSONL changed before replacement; original file was not replaced")
         os.replace(target_path, old_capture)
@@ -2330,7 +2342,7 @@ def _replace_file_after_validation(
         published_bytes = target_path.read_bytes()
         if sha256_hex(published_bytes) != candidate_sha256:
             raise RuntimeError("replacement target changed concurrently after publication; external bytes were left in place")
-        replaced_validation = validate_jsonl_bytes(published_bytes, source_label=target_path.name)
+        replaced_validation = validate_jsonl_bytes(published_bytes, source_label=target_path.name, contract=validation_contract)
         if not replaced_validation.get("ok"):
             raise ValueError(f"replacement validation failed: {replaced_validation.get('errors')}")
         backup = _ensure_verified_source_backup(target_path, source_bytes, backup, backup_dir)
@@ -2494,16 +2506,52 @@ def path_self_and_parents(path: pathlib.Path) -> List[pathlib.Path]:
     return [resolved, *resolved.parents]
 
 
+def guard_artifact_roles(source: pathlib.Path, candidate: Optional[pathlib.Path] = None, *,
+                         sidecars: Sequence[str] = (), **roles: Optional[pathlib.Path]) -> None:
+    """Compare resolved names (including dangling links) and existing filesystem identities."""
+    paths = {"input": source, "output": candidate, **roles}
+    if candidate is not None:
+        if sidecars and is_under_claude_root(candidate):
+            raise ValueError("--output process files must be outside the entire .claude directory")
+        for suffix in sidecars:
+            paths[suffix] = candidate.with_name(candidate.name + suffix)
+            if is_under_claude_root(paths[suffix]):
+                raise ValueError("derived reports must be outside the entire .claude directory")
+    names: Dict[pathlib.Path, str] = {}
+    identities: Dict[Tuple[int, int], str] = {}
+    for label, path in paths.items():
+        if path is None:
+            continue
+        resolved = path.resolve()
+        prior = names.get(resolved)
+        if prior:
+            raise ValueError(f"{prior} and {label} must be different files or directories")
+        names[resolved] = label
+        try:
+            stat = resolved.stat()
+        except FileNotFoundError:
+            continue
+        key = (stat.st_dev, stat.st_ino)
+        if stat.st_ino and key in identities:
+            raise ValueError(f"{identities[key]} and {label} must be different files or directories")
+        identities[key] = label
+
+
+COMPRESSION_SIDECARS = (".validation.json", ".report.md")
+
+
 def claude_root_ancestor(path: pathlib.Path) -> Optional[pathlib.Path]:
+    configured = resolve_claude_config_root()
     for node in path_self_and_parents(path):
-        if node.name.lower() == ".claude":
+        if node == configured or node.name.lower() == ".claude":
             return node
     return None
 
 
 def is_under_claude_projects(path: pathlib.Path) -> bool:
+    configured = resolve_claude_config_root()
     for node in path_self_and_parents(path):
-        if node.name.lower() == "projects" and node.parent.name.lower() == ".claude":
+        if node.name.lower() == "projects" and (node.parent == configured or node.parent.name.lower() == ".claude"):
             return True
     return False
 
@@ -2763,7 +2811,9 @@ def truncate(text: str, limit: int) -> str:
     text = str(text)
     if len(text) <= limit:
         return text
-    return text[: max(0, limit - 32)].rstrip() + f"\n...[truncated {len(text) - limit} chars]"
+    prefix = text[:max(0, limit - 32)].rstrip()
+    marker = f"\n...[truncated {len(text) - len(prefix)} chars]"
+    return prefix + marker if len(prefix) + len(marker) <= limit else text[:limit]
 
 
 def is_noisy_text(text: str) -> bool:
@@ -2948,12 +2998,14 @@ def user_record_origin(obj: JsonObj) -> str:
         return "local-command"
     if obj.get("isMeta") is True or is_system_reminder_only(text):
         return "injected"
+    if "<system-reminder>" in text and "</system-reminder>" in text:
+        return "mixed"
     msg = obj.get("message")
     return "human" if isinstance(msg, dict) and msg.get("role") == "user" else "unknown"
 
 
 def is_human_user_record(obj: JsonObj) -> bool:
-    return user_record_origin(obj) == "human"
+    return user_record_origin(obj) in {"human", "mixed"}
 
 
 def is_tool_result_user_record(obj: JsonObj) -> bool:
@@ -3290,6 +3342,85 @@ def _allowed_post_prompt_closure(obj: JsonObj, pending_tool_ids: set) -> Tuple[b
     return False, f"unsupported_record_type:{obj.get('type')}"
 
 
+def _trailing_turn_metadata(records, by_id, children, leaf, session):
+    """Return only attached bookkeeping positions, or None if the turn continues."""
+    pending = list(children[leaf])
+    positions = []
+    seen = {leaf}
+    while pending:
+        child = pending.pop()
+        row = records[by_id[child]]
+        passive = row.get("type") == "attachment" or (
+            row.get("type") == "system" and row.get("subtype") == "turn_duration")
+        if (child in seen or by_id[child] <= by_id[row["parentUuid"]] or row.get("isSidechain")
+                or row.get("sessionId") != session or not passive or is_api_message(row)):
+            return None
+        seen.add(child)
+        positions.append(by_id[child])
+        pending.extend(children[child])
+    return positions
+
+
+def closed_turn_candidates(records: Sequence[JsonObj], prompt: JsonObj) -> List[Dict[str, Any]]:
+    """Describe closed, same-session API descendants without changing the authoritative pointer."""
+    leaf = prompt.get("leafUuid")
+    if not isinstance(leaf, str) or not leaf:
+        return []
+    by_id = {r["uuid"]: i for i, r in enumerate(records) if isinstance(r.get("uuid"), str)}
+    session = prompt.get("sessionId")
+    if leaf not in by_id or not isinstance(session, str) or not session:
+        return []
+    children: Dict[str, List[str]] = collections.defaultdict(list)
+    for uid, i in by_id.items():
+        parent = records[i].get("parentUuid")
+        if isinstance(parent, str):
+            children[parent].append(uid)
+    if not children[leaf]:
+        return []
+    base = chain_trace_from_leaf(records, leaf)
+    if base.get("missingUuid") or base.get("loopUuid") or base.get("malformedParentUuid"):
+        return []
+    base_records = base["chain"]
+    candidates = []
+    queue = list(children[leaf])
+    visited = {leaf}
+    while queue:
+        uid = queue.pop()
+        if uid in visited:
+            continue
+        visited.add(uid)
+        obj = records[by_id[uid]]
+        msg = obj.get("message") or {}
+        if (not is_api_message(obj) or obj.get("isSidechain") or obj.get("sessionId") != prompt.get("sessionId")
+                or (api_role(obj) == "user" and not _tool_result_only_api_message(obj, set(tool_result_ids(obj))))):
+            continue
+        queue.extend(children[uid])
+        if (msg.get("stop_reason") or obj.get("stop_reason")) != "end_turn" and not tool_result_ids(obj):
+            continue
+        # A closed API turn can own bookkeeping after its answer. Inspect the
+        # entire subtree so a later API message behind an attachment stays visible.
+        metadata = _trailing_turn_metadata(records, by_id, children, uid, session)
+        if metadata is None:
+            continue
+        full = chain_trace_from_leaf(records, uid)["chain"]
+        extension = full[len(base_records):]
+        if not extension or not analyze_chain_physical_order(records, full)["ok"]:
+            continue
+        projection = [*full, dict(prompt, leafUuid=uid)]
+        validation = validate_records(projection, contract="selected-active-chain")
+        if not validation["ok"] or validation["tool_pair_partial_result_count"]:
+            continue
+        candidate = {"leafUuid": uid, "additionalRecords": len(extension), "isSelectedChainPrefix": True,
+                     "roles": dict(collections.Counter(api_role(r) for r in extension)),
+                     "replyPreview": one_line(semantic_message_text(obj), 160)}
+        if metadata:
+            candidate["trailingMetadata"] = {"count": len(metadata), "firstRecord": min(metadata) + 1,
+                                             "lastRecord": max(metadata) + 1,
+                                             "types": dict(collections.Counter(records[i]["type"] for i in metadata))}
+        candidates.append(candidate)
+    return sorted(candidates, key=lambda candidate: by_id[candidate["leafUuid"]])
+
+
 def _reject_resume_path(info: Dict[str, Any], reason_code: str, error: str) -> Dict[str, Any]:
     status = RESUME_REASON_CODE_STATUS.get(reason_code)
     if status is None or status == "valid":
@@ -3401,6 +3532,20 @@ def choose_resume_leaf_info(
     chain = list(trace.get("chain") or [])
     if not chain:
         return _reject_resume_path(info, "chain-empty", "authoritative resume chain is empty")
+    original_leaf = prompt_record.get("leafUuid")
+    if (resume_leaf_override and original_leaf != prompt_leaf
+            and isinstance(original_leaf, str) and any(r.get("uuid") == original_leaf for r in records)
+            and any(r.get("uuid") == prompt_leaf for r in records[prompt_index + 1:])
+            and not any(r.get("uuid") == original_leaf for r in chain)):
+        return _reject_resume_path(info, "extension-record-not-linear-descendant",
+                                   "post-pointer override is not a descendant of the authoritative leaf")
+    if (resume_leaf_override and original_leaf != prompt_leaf
+            and any(r.get("uuid") == original_leaf for r in chain)):
+        candidates = closed_turn_candidates(records, prompt_record)
+        if ([c["leafUuid"] for c in candidates] != [prompt_leaf]
+                or any(is_human_user_record(r) or user_record_origin(r) == "mixed" for r in records[prompt_index + 1:])):
+            return _reject_resume_path(info, "extension-record-not-safe-closure",
+                                       "explicit descendant requires one closed turn end and no later human prompt")
     uuid_to_index = {
         obj.get("uuid"): idx for idx, obj in enumerate(records)
         if isinstance(obj.get("uuid"), str) and obj.get("uuid")
@@ -3452,7 +3597,9 @@ def choose_resume_leaf_info(
                 return _reject_resume_path(
                     info,
                     "extension-limit-exceeded",
-                    f"post-last-prompt closure has {len(extension_pairs)} UUID records, "
+                    f"post-last-prompt closure has {len(extension_pairs)} records "
+                    f"({sum(bool(r.get('uuid')) for _, r in extension_pairs)} with UUID; "
+                    f"types={dict(collections.Counter(_diagnostic_counter_label(r, 'type') for _, r in extension_pairs))}), "
                     f"exceeding limit {max_post_prompt_extension}",
                 )
             expected_parent = prompt_leaf
@@ -3464,6 +3611,8 @@ def choose_resume_leaf_info(
                     "post-last-prompt closure requires a non-empty authority sessionId",
                 )
             pending_tool_ids = set(tool_use_ids(chain[-1]))
+            selectable = closed_turn_candidates(records, prompt_record)
+            unique_closed_leaf = selectable[0]["leafUuid"] if len(selectable) == 1 else None
             extension_reasons: List[str] = []
             for idx, obj in extension_pairs:
                 if not isinstance(obj.get("uuid"), str) or not obj.get("uuid"):
@@ -3486,6 +3635,10 @@ def choose_resume_leaf_info(
                         f"post-last-prompt record L{idx + 1} does not have the exact authority sessionId",
                     )
                 allowed, reason = _allowed_post_prompt_closure(obj, pending_tool_ids)
+                if (not allowed and api_role(obj) == "assistant" and unique_closed_leaf
+                        and not pending_tool_ids and not obj.get("isSidechain")):
+                    allowed, reason = True, "assistant_turn_closure"
+                    pending_tool_ids.update(tool_use_ids(obj))
                 if not allowed:
                     return _reject_resume_path(
                         info,
@@ -3501,6 +3654,9 @@ def choose_resume_leaf_info(
                     f"post-last-prompt closure leaves pending tool_use ids unresolved: "
                     f"{sorted(pending_tool_ids)[:20]}",
                 )
+            if expected_parent != unique_closed_leaf:
+                return _reject_resume_path(info, "extension-record-not-safe-closure",
+                                           "post-pointer sequence is not the unique closed turn end")
             selected_extension_records = [obj for _, obj in extension_pairs]
             chain.extend(selected_extension_records)
             chain_indexes.extend(idx for idx, _ in extension_pairs)
@@ -3648,6 +3804,7 @@ def select_active_correlated_snapshot_indexes(
     active_indexes: Sequence[int],
     max_snapshots: int,
     authority_index: Optional[int] = None,
+    diagnostics: Optional[Dict[str, Any]] = None,
 ) -> List[int]:
     if max_snapshots <= 0:
         return []
@@ -3659,8 +3816,13 @@ def select_active_correlated_snapshot_indexes(
         if isinstance(session_id, str):
             active_sessions.add(session_id)
     selected: List[int] = []
-    authority_stop = len(records) if authority_index is None else max(0, min(len(records), authority_index))
-    for idx, obj in enumerate(records[:authority_stop]):
+    active_index_set = set(active_indexes)
+    other_ids = set()
+    for idx, obj in enumerate(records):
+        if idx not in active_index_set and isinstance(obj.get("uuid"), str):
+            other_ids.update(v for v in (obj["uuid"], message_id(obj), obj.get("promptId")) if isinstance(v, str))
+    uncertain = []
+    for idx, obj in enumerate(records):
         if (
             obj.get("type") != "file-history-snapshot"
             or obj.get("uuid") is not None
@@ -3668,21 +3830,41 @@ def select_active_correlated_snapshot_indexes(
         ):
             continue
         snapshot_ids = _record_correlation_ids(obj)
-        session_id = obj.get("sessionId")
-        session_ok = not isinstance(session_id, str) or not active_sessions or session_id in active_sessions
-        if session_ok and snapshot_ids.intersection(active_ids):
+        snapshot = obj.get("snapshot")
+        if isinstance(snapshot, dict):
+            snapshot_ids.update(_record_correlation_ids(snapshot))
+        owners = [obj.get("sessionId")]
+        if isinstance(snapshot, dict):
+            owners.append(snapshot.get("sessionId"))
+        session_ok = all(owner is None or (isinstance(owner, str) and owner in active_sessions) for owner in owners)
+        if not snapshot_ids.intersection(active_ids):
+            continue
+        if session_ok and snapshot_ids.issubset(active_ids) and not snapshot_ids.intersection(other_ids):
             selected.append(idx)
+        else:
+            uncertain.append(idx + 1)
+    if diagnostics is not None:
+        diagnostics.update(uncertainSourceRecords=uncertain, externalBackupContents="unverified")
     return selected[-max_snapshots:]
 
 
-def select_control_projection_indexes(records: Sequence[JsonObj], session_id: Optional[str] = None) -> List[int]:
-    first_uuid_index = next((idx for idx, obj in enumerate(records) if isinstance(obj.get("uuid"), str)), len(records))
+def select_control_projection_indexes(records: Sequence[JsonObj], session_id: Optional[str] = None,
+                                      active_uuids: Optional[set] = None) -> List[int]:
     ui_types = {"mode", "permission-mode", "agent-name"}
-    selected = [
-        idx for idx, obj in enumerate(records[:first_uuid_index])
-        if isinstance(obj.get("type"), str) and obj.get("type") in ui_types and "uuid" not in obj
-    ]
-    selected.extend(idx for idx, obj in enumerate(records) if obj.get("type") == "last-prompt")
+    owners = {obj["sessionId"] for obj in records if isinstance(obj.get("sessionId"), str)}
+    selected = []
+    active_context = True
+    for idx, obj in enumerate(records):
+        kind = obj.get("type")
+        if kind == "last-prompt":
+            selected.append(idx)
+            active_context = active_uuids is None or str(obj.get("leafUuid")) in active_uuids
+        elif isinstance(obj.get("uuid"), str):
+            active_context = active_uuids is None or obj["uuid"] in active_uuids
+        elif (active_context and isinstance(kind, str) and kind in ui_types and "uuid" not in obj
+              and "parentUuid" not in obj and not obj.get("isSidechain")
+              and (obj.get("sessionId") == session_id or (not obj.get("sessionId") and len(owners) <= 1))):
+            selected.append(idx)
     title_index = select_session_title(records, session_id)["index"]
     if title_index is not None:
         selected.append(title_index)
@@ -3760,7 +3942,9 @@ def choose_active_chain_preservation(
                      prior_compact_last_position + 1 if prior_compact_last_position is not None else 0)
     turn_positions = [idx for idx in range(turn_floor, len(chain_records))
                       if is_human_user_record(chain_records[idx])]
-    if min_recent_turns and turn_positions:
+    if min_recent_turns > len(turn_positions):
+        raise InsufficientRecentTurns(min_recent_turns, len(turn_positions))
+    if min_recent_turns:
         chain_start = min(chain_start, turn_positions[-min(min_recent_turns, len(turn_positions))])
         chain_start = adjust_recent_start_for_tool_pairs(chain_records, chain_start)
         if chain_start < turn_floor:
@@ -3769,12 +3953,14 @@ def choose_active_chain_preservation(
     kept_pairs = chain_pairs[chain_start:]
     summary_indexes = [idx for idx, _ in summary_pairs]
     kept_indexes = [idx for idx, _ in kept_pairs]
+    snapshot_diagnostics: Dict[str, Any] = {}
     if checkpoint_policy == "active-correlated":
         file_history_snapshot_indexes = select_active_correlated_snapshot_indexes(
             records,
             kept_indexes,
             max_file_history_snapshots,
             authority_index=resume_leaf_info.get("lastPromptIndex"),
+            diagnostics=snapshot_diagnostics,
         )
     elif checkpoint_policy == "preserve-recent":
         raise ValueError(
@@ -3785,7 +3971,8 @@ def choose_active_chain_preservation(
         file_history_snapshot_indexes = []
     else:
         raise ValueError(f"unknown checkpoint policy: {checkpoint_policy}")
-    control_projection_indexes = select_control_projection_indexes(records, resume_leaf_info.get("currentSessionId"))
+    control_projection_indexes = select_control_projection_indexes(
+        records, resume_leaf_info.get("currentSessionId"), set(resume_leaf_info["activeChainUuids"]))
     active_index_set = set(chain_indexes)
     assigned = set(summary_indexes) | set(kept_indexes) | set(file_history_snapshot_indexes) | set(control_projection_indexes)
     excluded_branch_indexes = [
@@ -3823,6 +4010,7 @@ def choose_active_chain_preservation(
         "excludedUnattributedIndexes": excluded_unattributed_indexes,
         "keptIndexes": kept_indexes,
         "fileHistorySnapshotIndexes": file_history_snapshot_indexes,
+        "snapshotDiagnostics": snapshot_diagnostics,
         "checkpointPolicy": checkpoint_policy,
         "omittedIndexes": summary_indexes,
         "kept": [obj for _, obj in kept_pairs],
@@ -4790,6 +4978,12 @@ def make_summary_text(
 
 
 MODEL_SUMMARY_MARKER = "claude-jsonl-compressor:model-summary v11"
+MODEL_SUMMARY_HEADINGS = (
+    "Current State", "Timeline and Supersessions", "Decisions and Reasons",
+    "Assistant Research Decisions and Rationales", "Rejected or Superseded Alternatives",
+    "Evidence and Source Anchors", "User Wording and Constraints", "Risks, Unknowns, and Follow-Ups",
+    "Recent Raw Context Boundary",
+)
 
 
 def parse_model_summary_metadata(text: str) -> Dict[str, str]:
@@ -4989,17 +5183,7 @@ def validate_model_summary_text(
         errors.append("model summary required_claim_sources_digest does not match the generated evidence pack")
     if len(stripped) < min_chars:
         errors.append(f"model summary is too short for reliable semantic compression: {len(stripped)} chars")
-    required_headings = [
-        "Current State",
-        "Timeline and Supersessions",
-        "Decisions and Reasons",
-        "Assistant Research Decisions and Rationales",
-        "Rejected or Superseded Alternatives",
-        "Evidence and Source Anchors",
-        "User Wording and Constraints",
-        "Risks, Unknowns, and Follow-Ups",
-        "Recent Raw Context Boundary",
-    ]
+    required_headings = MODEL_SUMMARY_HEADINGS
     title_line = "# Model-Assisted Semantic Compression Summary"
     coverage_heading = "### Mandatory Evidence Coverage"
     allowed_heading_lines = {title_line, coverage_heading, *(f"## {heading}" for heading in required_headings)}
@@ -5238,12 +5422,7 @@ def validate_model_summary_text(
     }
 
 
-def compose_model_assisted_summary(
-    model_summary_text: str,
-    deterministic_summary_text: str,
-    summary_char_budget: int,
-) -> str:
-    model_text = model_summary_text.strip()
+def model_summary_envelope(model_text: str) -> str:
     fixed_parts = [
         "# Codex Offline Compression Summary",
         "This candidate uses model-assisted semantic compression. The model-authored section below was accepted only after source-digest, summary-source, evidence-group, and line-anchor validation. The deterministic safety appendix remains a bounded structural backstop.",
@@ -5251,7 +5430,16 @@ def compose_model_assisted_summary(
         model_text,
         "## Deterministic Safety Appendix",
     ]
-    fixed_text = "\n\n".join(fixed_parts)
+    return "\n\n".join(fixed_parts)
+
+
+def compose_model_assisted_summary(
+    model_summary_text: str,
+    deterministic_summary_text: str,
+    summary_char_budget: int,
+) -> str:
+    model_text = model_summary_text.strip()
+    fixed_text = model_summary_envelope(model_text)
     available_safety_chars = summary_char_budget - len(fixed_text) - 2
     minimum_safety_chars = min(800, len(deterministic_summary_text.strip()))
     if available_safety_chars < minimum_safety_chars:
@@ -5449,7 +5637,7 @@ def model_evidence_record(obj: JsonObj, original_line: int, tool_evidence: str =
         and bool(semantic_txt.strip())
     )
     origin = user_record_origin(obj)
-    is_injected_semantic = origin in ("injected", "unknown") and obj.get("type") == "user" and bool(semantic_txt.strip()) and not is_prior_summary
+    is_injected_semantic = origin in ("injected", "mixed", "unknown") and obj.get("type") == "user" and bool(semantic_txt.strip()) and not is_prior_summary
     full_tool = tool_evidence == "full" and bool(tool_use_ids(obj) or is_tool_result_user_record(obj))
     mandatory_semantic = is_human_semantic or is_assistant_semantic or is_injected_semantic or full_tool
     txt = full_tool_evidence_text(obj) if full_tool else semantic_txt if mandatory_semantic or is_prior_summary else record_text(obj)
@@ -6515,6 +6703,13 @@ def summarize_active_chain_window(records: Sequence[JsonObj], summary_uuid: str)
     }
 
 
+class InsufficientRecentTurns(ValueError):
+    def __init__(self, requested: int, available: int):
+        self.requested = requested
+        self.available = available
+        super().__init__(f"recent human turns unavailable: requested {requested}, available {available}")
+
+
 def select_preservation_plan(
     records: Sequence[JsonObj],
     raw_lines: Sequence[str],
@@ -6642,6 +6837,7 @@ def validate_source_active_chain_for_plan(
     plan: Dict[str, Any],
     *,
     physical_lines: Optional[Sequence[int]] = None,
+    v12_migration: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Validate the authoritative logical chain without inspecting inactive branches."""
     source_lines = _validated_record_lines(records, physical_lines)
@@ -6692,6 +6888,9 @@ def validate_source_active_chain_for_plan(
         active_records,
         physical_lines=active_record_lines,
         allow_nonmonotonic_diagnostic_lines=True,
+        contract="selected-active-chain",
+        migrated_prior_uuids={records[i].get("uuid") for i in plan["omitted_indexes"]
+                              if records[i].get("isCompactSummary") is True} if v12_migration else (),
     )
     if not validation.get("ok"):
         raise ValueError(
@@ -6702,11 +6901,84 @@ def validate_source_active_chain_for_plan(
 
 
 def check_strict_prior_capacity(plan: Dict[str, Any], summary_char_budget: int,
-                                requested: bool, overflow: str) -> None:
+                                requested: bool, overflow: str, target_tokens: Optional[int] = None) -> int:
+    locked = ""
     if requested and overflow == "error":
         # Even an empty new layer must fit. Pass 2 checks its actual complete size.
-        apply_prior_summary_verbatim_policy("", plan["omitted"], plan["omitted_indexes"],
-                                            summary_char_budget, True, overflow="error")
+        locked, _ = apply_prior_summary_verbatim_policy("", plan["omitted"], plan["omitted_indexes"],
+                                                        summary_char_budget, True, overflow="error")
+    # All retained messages and locked text survive publication. Serialization
+    # can only increase the estimate for the fixed summary text.
+    floor = estimate_records_tokens(plan["kept_original"]) + estimate_tokens(locked)
+    if target_tokens is not None and floor > target_tokens:
+        raise FixedCandidateBudgetError(floor, target_tokens, "fixed recent raw and locked prior content")
+    return floor
+
+
+class FixedCandidateBudgetError(ValueError):
+    def __init__(self, floor: int, target: int, detail: str = "fixed candidate projection"):
+        self.floor = floor
+        self.target = target
+        super().__init__(f"{detail} needs at least {floor} estimated tokens, "
+                         f"above requested target {target}")
+
+
+def minimum_v11_summary(pack: Dict[str, Any], source_digest: str, omitted_digest: str,
+                        handoff_digest: Optional[str], appendix: str) -> Tuple[str, Dict[str, Any]]:
+    """Lower bounds for the model text and validation metadata. This projection is never published."""
+    metadata = {"source_sha256": source_digest, "summary_source_sha256": omitted_digest,
+                "handoff_summary_digest": handoff_digest or "none"}
+    for key in ("evidence_anchor_lines_digest", "required_anchor_groups_digest", "pack_request_digest",
+                "required_claim_sources_digest"):
+        metadata[key] = pack[key]
+    lines = [f"<!-- {MODEL_SUMMARY_MARKER}", *(f"{k}:{v}" for k, v in metadata.items()), "-->",
+             "# Model-Assisted Semantic Compression Summary", *(f"## {h}" for h in MODEL_SUMMARY_HEADINGS),
+             "### Mandatory Evidence Coverage"]
+    claims = pack["required_claim_sources"]
+    for key, text in claims.items():
+        # The validator requires a literal source excerpt of at least this many characters.
+        shortest = "x" * min(12, len(text.strip()))
+        lines.append(f'- L{key} support_text_json="{shortest}" disposition=covered')
+    # All of these strings must occur somewhere in every accepted model file. Separators
+    # account for only one ASCII character each. Actual whitespace or anchor syntax may cost more.
+    model_floor = " ".join(lines)
+    # Every accepted composition reserves at least min(800, len(appendix)) characters.
+    # truncate() retains this common prefix under every permitted allocation.
+    safety = appendix.strip()
+    minimum_safety_chars = min(800, len(safety))
+    if len(safety) > minimum_safety_chars:
+        safety = safety[:max(0, minimum_safety_chars - 32)].rstrip()
+    # Measure the entire minimum even when both independent ceilings are impossible.
+    summary = model_summary_envelope(model_floor) + "\n\n" + safety
+    validation = {"ok": True, "errors": [], "warnings": [], "metadata": metadata,
+                  "chars": len(model_floor), "pack_request_digest": pack["pack_request_digest"],
+                  "evidence_anchor_lines_digest": pack["evidence_anchor_lines_digest"],
+                  "required_anchor_groups_digest": pack["required_anchor_groups_digest"],
+                  "required_claim_sources_digest": pack["required_claim_sources_digest"],
+                  "required_claim_source_count": len(claims), "mandatory_claim_coverage_count": len(claims)}
+    return summary, validation
+
+
+def reject_unsupported_legacy_media(plan: Dict[str, Any]) -> None:
+    # This entry also runs under python -I, which omits the bundled script directory.
+    spec = importlib.util.spec_from_file_location("_compressor_evidence", pathlib.Path(__file__).with_name("v12_evidence.py"))
+    if spec is None or spec.loader is None:
+        raise ImportError("bundled v12_evidence.py is unavailable")
+    evidence = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(evidence)
+
+    for index, obj in zip(plan["omitted_indexes"], plan["omitted"]):
+        def reject(path, kind):
+            raise ValueError(f"unsupported media ({kind}) at {path} in older record {index + 1}: "
+                             "keep the complete turn raw or approve original-only retention in v12")
+
+        message = obj.get("message")
+        if isinstance(message, dict):
+            content = message.get("content")
+            evidence.project_media(content, "message.content", reject, native=isinstance(content, list))
+        for key in ("toolUseResult", "attachment"):
+            if key in obj:
+                evidence.project_media(obj[key], key, reject)
 
 
 def preflight_jsonl(input_path: pathlib.Path, target_ratio: float = .3, min_recent_records: int = 120,
@@ -6717,7 +6989,8 @@ def preflight_jsonl(input_path: pathlib.Path, target_ratio: float = .3, min_rece
     info = choose_resume_leaf_info(records, options.get("max_post_prompt_extension", 0), options.get("resume_leaf_override"))
     result: Dict[str, Any] = {"ok": False, "source_sha256": sha256_hex(source),
         "topology": public_resume_leaf_info(info), "state": "topology-invalid"}
-    if not info["ok"]:
+    strict_chain = options.get("preserve_active_chain", True)
+    if not info["ok"] and strict_chain:
         return result
 
     def chain_check(topology: Dict[str, Any]) -> Dict[str, Any]:
@@ -6734,10 +7007,14 @@ def preflight_jsonl(input_path: pathlib.Path, target_ratio: float = .3, min_rece
             out.update(ok=False, error=_bounded_diagnostic_text(str(exc)))
         return out
 
-    result["activeChain"] = chain_check(info)
+    result["activeChain"] = chain_check(info) if info["ok"] else {"ok": False, "selected": False}
+    result["closedTurnCandidates"] = closed_turn_candidates(records, info["lastPromptTemplate"]) if info["ok"] else []
     candidate_leaf = latest_physical_uuid(records)
-    if candidate_leaf != info["selectedLeafUuid"]:
-        candidate = choose_resume_leaf_info(records, resume_leaf_override=candidate_leaf)
+    if info["ok"] and candidate_leaf != info["selectedLeafUuid"]:
+        # Inspect a projected tail independently of whether it is eligible for authorized extension.
+        tail_prompt = dict(info["lastPromptTemplate"], leafUuid=candidate_leaf)
+        candidate = choose_resume_leaf_info([*records, tail_prompt])
+        candidate["lastPromptIndex"] = info["lastPromptIndex"]
         selected_indexes = info["activeChainIndexes"]
         candidate_indexes = candidate.get("activeChainIndexes") or []
         result["physicalTailCandidate"] = {"topologyOk": candidate["ok"], "reasonCode": candidate["reasonCode"],
@@ -6747,7 +7024,7 @@ def preflight_jsonl(input_path: pathlib.Path, target_ratio: float = .3, min_rece
             "selected": False}
         if candidate["ok"]:
             result["physicalTailCandidate"]["chainValidation"] = chain_check(candidate)
-    if not result["activeChain"]["ok"]:
+    if strict_chain and not result["activeChain"]["ok"]:
         result["state"] = "selected-chain-invalid"
         return result
     ratio, input_tokens = effective_target_ratio_for_tokens(records, target_ratio, options.get("target_estimated_tokens"))
@@ -6756,6 +7033,10 @@ def preflight_jsonl(input_path: pathlib.Path, target_ratio: float = .3, min_rece
             options.get("preserve_active_chain", True), options.get("max_post_prompt_extension", 0),
             options.get("max_file_history_snapshots", 80), options.get("checkpoint_policy", "active-correlated"),
             options.get("resume_leaf_override"), options.get("min_recent_turns", 0), allow_empty_summary=True)
+    except InsufficientRecentTurns as exc:
+        result.update(state="insufficient-recent-turns", error=str(exc),
+                      partition={"requestedRecentTurns": exc.requested, "availableRecentTurns": exc.available})
+        return result
     except ValueError as exc:
         result.update(state="partition-unavailable", error=_bounded_diagnostic_text(str(exc)))
         return result
@@ -6769,6 +7050,7 @@ def preflight_jsonl(input_path: pathlib.Path, target_ratio: float = .3, min_rece
         "oldUserOrigins": dict(collections.Counter(user_record_origin(r) for r in older if r.get("type") == "user")),
         "rawHumanMessages": sum(is_human_user_record(r) for r in plan["kept_original"]),
         "retainedSnapshots": len(plan["file_history_snapshots_original"]),
+        "snapshotDiagnostics": (plan.get("preserve_info") or {}).get("snapshotDiagnostics", {}),
         "requestedRecentTurns": options.get("min_recent_turns", 0),
         "availableRecentTurns": (plan.get("preserve_info") or {}).get("availableRecentTurns", 0)}
     title = select_session_title(records, info.get("currentSessionId"))
@@ -6784,6 +7066,14 @@ def preflight_jsonl(input_path: pathlib.Path, target_ratio: float = .3, min_rece
         result["pack"] = {"chars": pack["pack_chars"], "estimatedTokens": pack["pack_estimated_tokens"],
                           "mandatoryRecords": pack["mandatory_semantic_record_count"], "fits": True}
         result.update(ok=True, state="ready")
+        if pack["fixed_candidate_lower_bound_tokens"] is not None:
+            floor = pack["fixed_candidate_lower_bound_tokens"]
+            result["estimates"].update(fixedLowerBoundTokens=floor,
+                                       remainingEstimatedTokens=options["target_estimated_tokens"] - floor)
+            result["state"] = "budget-pending-draft"
+    except FixedCandidateBudgetError as exc:
+        result["estimates"].update(fixedLowerBoundTokens=exc.floor, remainingEstimatedTokens=exc.target - exc.floor)
+        result.update(state="budget-unavailable", error=str(exc), pack=None)
     except ValueError as exc:
         result.update(state="pack-unavailable", error=_bounded_diagnostic_text(str(exc)), pack={"fits": False})
     return result
@@ -6808,12 +7098,16 @@ def build_model_summary_pack_for_input(
     citation_style: str = "legacy",
     prior_summary_overflow: str = "fold",
     min_recent_turns: int = 0,
+    target_session_id: Optional[str] = None,
+    single_resume_chain: bool = False,
+    append_final_prompt: bool = False,
 ) -> Dict[str, Any]:
     require_summary_char_budget(summary_char_budget)
     if min_recent_records < 0:
         raise ValueError("min_recent_records must be non-negative")
     if handoff_summary_path is not None and is_under_claude_root(handoff_summary_path):
         raise ValueError("--handoff-summary process files must be outside the entire .claude directory")
+    guard_artifact_roles(input_path, handoff=handoff_summary_path)
     source_bytes = input_path.read_bytes()
     records, raw_lines, physical_lines = parse_jsonl_bytes_with_lines(source_bytes, source_label=str(input_path))
     if not records:
@@ -6841,7 +7135,9 @@ def build_model_summary_pack_for_input(
         plan,
         physical_lines=physical_lines,
     )
-    check_strict_prior_capacity(plan, summary_char_budget, preserve_prior_summaries_verbatim, prior_summary_overflow)
+    check_strict_prior_capacity(plan, summary_char_budget, preserve_prior_summaries_verbatim, prior_summary_overflow,
+                                target_estimated_tokens)
+    reject_unsupported_legacy_media(plan)
     source_sha256 = sha256_hex(source_bytes)
     source_digest = source_sha256
     omitted_digest = sha256_hex("\n".join(raw_lines[idx] for idx in plan["omitted_indexes"]).encode("utf-8"))
@@ -6886,6 +7182,27 @@ def build_model_summary_pack_for_input(
         citation_style=citation_style,
         prior_summary_overflow=prior_summary_overflow,
     )
+    fixed_floor = None
+    if target_estimated_tokens is not None:
+        measured = compress_jsonl(
+            input_path, None, target_ratio, min_recent_records, summary_char_budget,
+            target_session_id=target_session_id, single_resume_chain=single_resume_chain,
+            append_final_prompt=append_final_prompt, preserve_active_chain=preserve_active_chain,
+            max_post_prompt_extension=max_post_prompt_extension, max_file_history_snapshots=max_file_history_snapshots,
+            checkpoint_policy=checkpoint_policy, resume_leaf_override=resume_leaf_override,
+            model_pack_char_budget=model_pack_char_budget, model_pack_estimated_token_budget=model_pack_estimated_token_budget,
+            handoff_summary_path=handoff_summary_path, preserve_prior_summaries_verbatim=preserve_prior_summaries_verbatim,
+            tool_evidence=tool_evidence, citation_style=citation_style, min_recent_turns=min_recent_turns,
+            prior_summary_overflow=prior_summary_overflow, target_estimated_tokens=target_estimated_tokens,
+            _v11_floor_pack=pack)
+        fixed_floor = measured["fixedTokens"]
+        if measured["sourceSha256"] != source_sha256:
+            raise ValueError("source changed while measuring v11 budget; repeat before semantic work")
+        if fixed_floor > target_estimated_tokens:
+            raise FixedCandidateBudgetError(fixed_floor, target_estimated_tokens)
+        if measured["minimumSummaryChars"] > summary_char_budget:
+            raise ValueError(f"fixed v11 summary protocol needs at least {measured['minimumSummaryChars']} chars, "
+                             f"above summary character budget {summary_char_budget}")
     pack_text = str(pack["text"])
     evidence_anchor_lines = list(pack["evidence_anchor_lines"])
     evidence_anchor_lines_digest = str(pack["evidence_anchor_lines_digest"])
@@ -6906,6 +7223,7 @@ def build_model_summary_pack_for_input(
         "preserve_mode": plan["preserve_mode"],
         "selected_leaf_uuid": plan["selected_leaf_uuid"],
         "pack_chars": len(pack_text),
+        "fixed_candidate_lower_bound_tokens": fixed_floor,
         "pack_estimated_tokens": int(pack.get("estimated_tokens") or 0),
         "model_pack_estimated_token_budget": int(pack.get("estimated_token_budget") or 0),
         "evidence_truncated": bool(pack.get("evidence_truncated")),
@@ -6952,7 +7270,7 @@ def build_model_summary_pack_for_input(
 
 def compress_jsonl(
     input_path: pathlib.Path,
-    output_path: pathlib.Path,
+    output_path: Optional[pathlib.Path],
     target_ratio: float,
     min_recent_records: int,
     summary_char_budget: int,
@@ -6976,17 +7294,20 @@ def compress_jsonl(
     citation_style: str = "legacy",
     prior_summary_overflow: str = "fold",
     min_recent_turns: int = 0,
+    v12_memory: Optional[Dict[str, Any]] = None,
+    v12_measure_only: bool = False,
+    _v11_floor_pack: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     require_summary_char_budget(summary_char_budget)
     if min_recent_records < 0:
         raise ValueError("min_recent_records must be non-negative")
-    try:
-        if input_path.resolve() == output_path.resolve():
-            raise ValueError("--input and --output must be different files")
-    except FileNotFoundError:
-        if input_path.absolute() == output_path.absolute():
-            raise ValueError("--input and --output must be different files")
-    if is_under_claude_root(output_path):
+    guard_artifact_roles(input_path, output_path, sidecars=COMPRESSION_SIDECARS,
+                         handoff=handoff_summary_path, summary=model_summary_path)
+    if v12_measure_only and (v12_memory is None or output_path is not None):
+        raise ValueError("v12 measurement requires an in-memory candidate")
+    if _v11_floor_pack is not None and (output_path is not None or v12_memory or deterministic_summary or model_summary_path):
+        raise ValueError("v11 budget projection must be in-memory only")
+    if output_path is not None and is_under_claude_root(output_path):
         raise ValueError("candidate JSONL and sidecars must be outside the entire .claude directory")
     if handoff_summary_path is not None and is_under_claude_root(handoff_summary_path):
         raise ValueError("--handoff-summary process files must be outside the entire .claude directory")
@@ -7042,8 +7363,12 @@ def compress_jsonl(
         records,
         plan,
         physical_lines=physical_lines,
+        v12_migration=v12_memory is not None,
     )
-    check_strict_prior_capacity(plan, summary_char_budget, preserve_prior_summaries_verbatim, prior_summary_overflow)
+    check_strict_prior_capacity(plan, summary_char_budget, preserve_prior_summaries_verbatim, prior_summary_overflow,
+                                target_estimated_tokens)
+    if v12_memory is None:
+        reject_unsupported_legacy_media(plan)
     preserve_info = plan["preserve_info"]
     omitted = list(plan["omitted"])
     kept_original = list(plan["kept_original"])
@@ -7086,7 +7411,7 @@ def compress_jsonl(
         current_session_id = preserve_info.get("resumeLeafInfo", {}).get("currentSessionId")
         if isinstance(current_session_id, str) and current_session_id:
             common["sessionId"] = current_session_id
-    deterministic_summary_text = make_summary_text(
+    deterministic_summary_text = "" if v12_memory is not None else make_summary_text(
         omitted,
         kept + file_history_snapshots,
         input_path,
@@ -7104,7 +7429,26 @@ def compress_jsonl(
     model_pack_optional_evidence_omission_reasons: Optional[Dict[str, int]] = None
     semantic_summary_mode = "deterministic-fallback"
     summary_text = deterministic_summary_text
-    if model_summary_path is None and not deterministic_summary:
+    if v12_memory is not None:
+        if (model_summary_path is not None or deterministic_summary or not preserve_active_chain
+                or source_sha256 != v12_memory["source"] or selected_leaf_uuid != v12_memory["leaf"]
+                or omitted_indexes != v12_memory["omitted"]):
+            raise ValueError("v12 memory and selected source do not match")
+        summary_text = v12_memory["body"]
+        semantic_summary_mode = "model-assisted-v12"
+    elif _v11_floor_pack is not None:
+        pack = _v11_floor_pack
+        if pack["pack_request_digest"] != pack_request_digest:
+            raise ValueError("v11 budget projection options changed during preflight")
+        summary_text, model_summary_validation = minimum_v11_summary(
+            pack, source_digest, omitted_text_digest, handoff_digest, deterministic_summary_text)
+        semantic_summary_mode = "model-assisted-v11"
+        model_pack_estimated_tokens = pack["estimated_tokens"]
+        model_pack_evidence_truncated = pack["evidence_truncated"]
+        model_pack_optional_evidence_omitted_count = pack["optional_evidence_omitted_count"]
+        model_pack_optional_evidence_omitted_lines_digest = pack["optional_evidence_omitted_lines_digest"]
+        model_pack_optional_evidence_omission_reasons = pack["optional_evidence_omission_reasons"]
+    elif model_summary_path is None and not deterministic_summary:
         raise ValueError(
             "model-assisted compression requires model_summary_path by default. "
             "Pass deterministic_summary=True only when the user explicitly asked for deterministic fallback."
@@ -7168,12 +7512,16 @@ def compress_jsonl(
             raise ValueError(f"model summary validation failed: {model_summary_validation.get('errors')}")
         summary_text = compose_model_assisted_summary(model_summary_text, deterministic_summary_text, summary_char_budget)
         semantic_summary_mode = "model-assisted-v11"
+    # Optional verbatim text may fold once the real draft is available. Only its
+    # strict form is a fixed cost. The policy receipt also varies with the draft.
+    project_optional_fold = _v11_floor_pack is not None and prior_summary_overflow == "fold"
+    minimum_summary_chars = len(summary_text) if _v11_floor_pack is not None else None
     summary_text, prior_summary_verbatim_policy = apply_prior_summary_verbatim_policy(
         summary_text,
         omitted,
         omitted_indexes,
         summary_char_budget,
-        preserve_prior_summaries_verbatim,
+        preserve_prior_summaries_verbatim and not project_optional_fold,
         overflow=prior_summary_overflow,
     )
     kept_first_uuid = next((obj.get("uuid") for obj in kept if isinstance(obj.get("uuid"), str)), None)
@@ -7247,6 +7595,20 @@ def compress_jsonl(
             "firstRecentUuid": kept_first_uuid,
         },
     }
+    if _v11_floor_pack is not None:
+        metadata["modelSummaryFileLabel"] = "MODEL_SUMMARY"
+        # For a soft verbatim request the real draft may force folding. Retain only
+        # receipt fields shared by both outcomes. Strict spans are already fixed.
+        if project_optional_fold and preserve_prior_summaries_verbatim:
+            metadata["priorSummaryVerbatimPolicy"] = {
+                key: prior_summary_verbatim_policy[key]
+                for key in ("budgetFactor", "baseSummaryChars", "priorSummaryCount", "priorSummaryChars",
+                            "priorSummaryDigests")
+            }
+    if v12_memory is not None:
+        metadata = {"trigger": "manual", "codexOfflineCompression": True,
+                    "semanticSummaryMode": semantic_summary_mode, "modelPackSchemaVersion": "v12",
+                    "auditSha256": v12_memory["auditSha256"]}
     boundary = make_boundary_record(common, parent_uuid, boundary_uuid, summary_uuid, kept_first_uuid, metadata)
     summary = make_summary_record(common, boundary_uuid, summary_uuid, summary_text)
     present = {boundary_uuid, summary_uuid}
@@ -7290,11 +7652,18 @@ def compress_jsonl(
         raise ValueError("final session title projection did not preserve the selected source record")
     active_chain_window = summarize_active_chain_window(output_records, summary_uuid)
     output_estimated_tokens = estimate_records_tokens(output_records)
+    if _v11_floor_pack is not None:
+        return {"fixedTokens": output_estimated_tokens, "minimumSummaryChars": minimum_summary_chars,
+                "sourceSha256": source_sha256}
+    if v12_measure_only:
+        return {"fixedTokens": output_estimated_tokens}
     if target_estimated_tokens is not None and output_estimated_tokens > target_estimated_tokens:
         raise ValueError(
             f"generated candidate is estimated at {output_estimated_tokens} message tokens, above requested "
             f"target {target_estimated_tokens}; reduce --min-recent-records or --summary-char-budget"
         )
+    guard_artifact_roles(input_path, output_path, sidecars=COMPRESSION_SIDECARS,
+                         handoff=handoff_summary_path, summary=model_summary_path)
     validation = publish_validated_jsonl(output_path, output_records)
     output_bytes = output_path.stat().st_size
 
@@ -7351,6 +7720,7 @@ def compress_jsonl(
         "recent_records_preserved": len(kept),
         "file_history_snapshots_preserved": len(file_history_snapshots),
         "file_history_snapshot_source_lines": [idx + 1 for idx in file_history_snapshot_indexes],
+        "snapshot_diagnostics": (preserve_info or {}).get("snapshotDiagnostics", {}),
         "checkpoint_policy": checkpoint_policy,
         "preserve_mode": preserve_mode,
         "selected_leaf_uuid": selected_leaf_uuid,
@@ -7389,8 +7759,17 @@ def compress_jsonl(
         "validation": validation,
     }
     if write_sidecar_files:
+        guard_artifact_roles(input_path, output_path, sidecars=COMPRESSION_SIDECARS,
+                             handoff=handoff_summary_path, summary=model_summary_path)
         write_sidecars(output_path, report)
     return report
+
+
+def is_plain_prior_list(content: Any) -> bool:
+    return isinstance(content, list) and all(
+        isinstance(block, dict) and set(block) == {"type", "text"}
+        and block["type"] == "text" and isinstance(block["text"], str) for block in content
+    )
 
 
 def validate_records(
@@ -7398,7 +7777,12 @@ def validate_records(
     physical_lines: Optional[Sequence[int]] = None,
     *,
     allow_nonmonotonic_diagnostic_lines: bool = False,
+    contract: str = "historical-source",
+    migrated_prior_uuids: Collection[str] = (),
 ) -> Dict[str, Any]:
+    if contract not in {"historical-source", "selected-active-chain", "fresh-candidate"}:
+        raise ValueError(f"unknown validation contract {contract}")
+    fresh = contract == "fresh-candidate"
     errors: List[str] = []
     warnings: List[str] = []
     record_lines = _validated_record_lines(
@@ -7711,7 +8095,9 @@ def validate_records(
     compact_boundary_resume_errors: List[JsonObj] = []
     compact_boundary_resume_samples: List[JsonObj] = []
     compact_current_pair_errors: List[JsonObj] = []
-    if codex_boundaries:
+    if fresh:
+        if len(compact_boundaries) != 1:
+            compact_current_pair_errors.append({"reason": "expected one compact boundary in a fresh candidate"})
         if len(codex_boundaries) != 1:
             compact_current_pair_errors.append(
                 {"reason": "expected exactly one Codex-created compact_boundary", "count": len(codex_boundaries)}
@@ -7724,6 +8110,7 @@ def validate_records(
             compact_current_pair_errors.append(
                 {"reason": "expected exactly one last-prompt in compressed candidate", "count": len(last_prompt_records)}
             )
+    if fresh and codex_boundaries:
         current_boundary = codex_boundaries[-1]
         codex_current_boundary_uuid = current_boundary.get("uuid") if isinstance(current_boundary.get("uuid"), str) else None
         paired_summaries = [
@@ -7745,6 +8132,12 @@ def validate_records(
             errors.append(f"compact_boundary {obj.get('uuid')} lacks compactMetadata object")
             continue
         preserved = metadata.get("preservedMessages") or metadata.get("preserved")
+        uuidless_tail = (metadata.get("preserveMode") == "physical-tail" and codex_current_summary_uuid
+                         and latest_physical_uuid(records) == codex_current_summary_uuid)
+        if fresh and not uuidless_tail and (not isinstance(preserved, dict) or not isinstance(metadata.get("preservedSegment"), dict)
+                      or preserved.get("anchorUuid") != codex_current_summary_uuid):
+            compact_metadata_preserved_errors.append(
+                {"uuid": obj.get("uuid"), "reason": "fresh candidate must anchor both preserved snapshots at its summary"})
         if preserved is not None:
             if not isinstance(preserved, dict):
                 compact_metadata_preserved_errors.append({"uuid": obj.get("uuid"), "reason": "preserved is not object"})
@@ -7852,12 +8245,15 @@ def validate_records(
         errors.append(f"current compact pair invalid: {compact_current_pair_errors[:20]}")
     for obj in compact_summaries:
         msg = obj.get("message")
-        if not (
-            isinstance(msg, dict)
-            and msg.get("role") == "user"
-            and isinstance(msg.get("content"), str)
-            and bool(msg.get("content").strip())
-        ):
+        content = msg.get("content") if isinstance(msg, dict) else None
+        migratable = (contract == "selected-active-chain" and obj.get("uuid") in migrated_prior_uuids
+                      and (isinstance(content, str) or is_plain_prior_list(content)))
+        if not (isinstance(msg, dict) and msg.get("role") == "user"
+                and (migratable or isinstance(content, str) and content.strip())):
+            if contract == "selected-active-chain" and obj.get("uuid") in migrated_prior_uuids:
+                errors.append(f"unsupported historical summary shape at {obj.get('uuid')}; "
+                              "retain and continue from the original session")
+                continue
             errors.append(f"isCompactSummary {obj.get('uuid')} lacks non-empty message.role=user/content text")
     if not compact_boundaries:
         warnings.append("no compact_boundary records")
@@ -7952,7 +8348,7 @@ def validate_records(
             continue
         actual = list(reversed(before_anchor))
         declared_is_historical_prefix = len(declared) <= len(actual) and declared == actual[: len(declared)]
-        if not declared_is_historical_prefix:
+        if not declared_is_historical_prefix or (fresh and declared != actual):
             compact_metadata_chain_mismatch.append(
                 {
                     "uuid": boundary.get("uuid"),
@@ -8023,9 +8419,9 @@ def validate_records(
         warnings.append(
             f"excluded/inactive records contain {excluded_cross_session_parent_count} cross-session parent edge(s)"
         )
-    if compact_boundaries and latest_last_prompt_leaf and not active_chain_has_compact_boundary:
+    if fresh and compact_boundaries and latest_last_prompt_leaf and not active_chain_has_compact_boundary:
         errors.append("latest last-prompt active chain does not include compact_boundary")
-    if compact_summaries and latest_last_prompt_leaf and not active_chain_has_compact_summary:
+    if fresh and compact_summaries and latest_last_prompt_leaf and not active_chain_has_compact_summary:
         errors.append("latest last-prompt active chain does not include isCompactSummary")
     if codex_current_boundary_uuid and codex_current_boundary_uuid not in active_chain_uuid_set:
         errors.append(f"latest last-prompt active chain does not include current Codex compact_boundary {codex_current_boundary_uuid}")
@@ -8037,8 +8433,11 @@ def validate_records(
             f"{len(compact_metadata_chain_mismatch)} item(s)"
         )
     type_counts = collections.Counter(_diagnostic_counter_label(obj, "type") for obj in records)
+    if fresh and (compact_metadata_historical_reference_warnings or compact_metadata_chain_mismatch):
+        errors.append("fresh candidate compactMetadata snapshot is not current")
     session_counts = collections.Counter(_diagnostic_counter_label(obj, "sessionId") for obj in records)
     validation = {
+        "contract": contract,
         "ok": not errors,
         "errors": errors,
         "warnings": warnings,
@@ -8127,17 +8526,17 @@ def validate_records(
     )
 
 
-def validate_jsonl(path: pathlib.Path) -> Dict[str, Any]:
+def validate_jsonl(path: pathlib.Path, contract: str = "historical-source") -> Dict[str, Any]:
     data = path.read_bytes()
-    result = validate_jsonl_bytes(data, source_label=public_path_label(path) or "JSONL")
+    result = validate_jsonl_bytes(data, source_label=public_path_label(path) or "JSONL", contract=contract)
     result["path"] = public_path_label(path)
     result["bytes"] = len(data)
     return result
 
 
-def validate_jsonl_bytes(data: bytes, source_label: str = "JSONL") -> Dict[str, Any]:
+def validate_jsonl_bytes(data: bytes, source_label: str = "JSONL", contract: str = "historical-source") -> Dict[str, Any]:
     records, _raw_lines, physical_lines = parse_jsonl_bytes_with_lines(data, source_label=source_label)
-    result = validate_records(records, physical_lines=physical_lines)
+    result = validate_records(records, physical_lines=physical_lines, contract=contract)
     result["path"] = pathlib.Path(source_label).name
     result["bytes"] = len(data)
     result["sha256"] = sha256_hex(data)
@@ -8354,6 +8753,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Read and report strict resume topology for --input without generating packs, candidates, sidecars, or backups",
     )
     parser.add_argument("--validate-only", type=pathlib.Path, help="Validate one JSONL and exit without compression writes")
+    parser.add_argument("--validation-contract", choices=("historical-source", "fresh-candidate"),
+                        default="historical-source", help="Contract used by --validate-only")
     parser.add_argument("--preflight", action="store_true", help="Read-only topology, tool closure, partition and evidence capacity report")
     parser.add_argument("--tool-evidence", choices=("excerpt", "full"), default="excerpt", help="Full preserves complete older tool payloads within unchanged pack ceilings")
     parser.add_argument("--citation-style", choices=("legacy", "scoped"), default="legacy", help="Scoped prose uses [@L42] / [@H3], keeping document identifiers literal")
@@ -8363,6 +8764,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments[:1] == ["v12"]:
+        bundled = str(pathlib.Path(__file__).resolve().parent)
+        if not sys.path or sys.path[0] != bundled:
+            sys.path.insert(0, bundled)
+        import v12_workflow
+        return v12_workflow.main(arguments[1:], sys.modules[__name__])
     args = parse_args(argv)
     try:
         if args.version:
@@ -8375,7 +8783,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             }, ensure_ascii=False, indent=2))
             return 0
         if args.validate_only:
-            result = validate_jsonl(args.validate_only)
+            result = validate_jsonl(args.validate_only, contract=args.validation_contract)
             print(json.dumps(result, ensure_ascii=False, indent=2))
             return 0 if result.get("ok") else 2
         if args.analyze_resume_path:
@@ -8431,6 +8839,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             raise ValueError("--max-file-history-snapshots must be non-negative")
         if args.model_summary and args.deterministic_summary:
             raise ValueError("--model-summary and --deterministic-summary are mutually exclusive")
+        candidate_role = (args.work_dir / f"{args.input.stem}.compressed-candidate.jsonl"
+                          if args.replace_original else args.output)
+        path_roles = dict(pack=args.write_model_pack, model=args.model_summary, handoff=args.handoff_summary,
+                          work=args.work_dir, backup_dir=args.backup_dir, template=args.summary_template,
+                          words=args.importance_words, topics=args.topic_patterns,
+                          backup=numbered_backup_path(args.input, args.backup_dir) if args.replace_original else None)
+        guard_artifact_roles(args.input, candidate_role, sidecars=COMPRESSION_SIDECARS, **path_roles)
         process_paths = [
             ("--output", args.output),
             ("--work-dir", args.work_dir),
@@ -8460,7 +8875,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 handoff_summary_path=args.handoff_summary, preserve_prior_summaries_verbatim=args.preserve_prior_summaries_verbatim,
                 target_estimated_tokens=args.target_estimated_tokens, tool_evidence=args.tool_evidence,
                 citation_style=args.citation_style, prior_summary_overflow=args.prior_summary_overflow,
-                min_recent_turns=args.min_recent_turns)
+                min_recent_turns=args.min_recent_turns, target_session_id=args.target_session_id,
+                single_resume_chain=args.single_resume_chain, append_final_prompt=True)
             print(json.dumps(result, ensure_ascii=False, indent=2))
             return 0 if result["ok"] else 2
         if args.write_model_pack:
@@ -8483,7 +8899,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 citation_style=args.citation_style,
                 prior_summary_overflow=args.prior_summary_overflow,
                 min_recent_turns=args.min_recent_turns,
+                target_session_id=args.target_session_id, single_resume_chain=args.single_resume_chain,
+                append_final_prompt=True,
             )
+            guard_artifact_roles(args.input, candidate_role, sidecars=COMPRESSION_SIDECARS, **path_roles)
+            if file_sha256(args.input) != pack["source_sha256"]:
+                raise ValueError("source changed before pack publication")
             write_model_summary_pack(args.write_model_pack, pack["text"])
             out = {
                 k: v
@@ -8555,6 +8976,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 backup_dir=args.backup_dir,
                 expected_source_sha256=str(report.get("source_sha256")),
                 expected_candidate_sha256=str((report.get("validation") or {}).get("sha256")),
+                validation_contract="fresh-candidate",
             )
             backup_path = replacement["backup_path"]
             replaced_validation = replacement["validation"]
@@ -8569,6 +8991,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             report["operation_state"] = replacement["operation_state"]
             report["replacement_cleanup_errors"] = replacement["cleanup_errors"]
             try:
+                guard_artifact_roles(args.input, output_path, sidecars=COMPRESSION_SIDECARS, **path_roles)
                 write_sidecars(output_path, report)
             except Exception as report_exc:
                 receipt = {

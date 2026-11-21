@@ -1,7 +1,7 @@
 interface:
   display_name: "Claude JSONL Compressor"
-  short_description: "Compress one Claude JSONL with a source-anchored model summary."
-  default_prompt: "Use $claude-jsonl-compressor on one Claude Code JSONL. Preflight the last-prompt chain and evidence capacity, exclude rewound branches, preserve its final name and requested recent context, use the model-assisted two-pass workflow, and validate the result. Follow the skill's backup, strict old-summary, cost and optional review rules; use full tool evidence when the user's research requires it. Keep repair separate and do not broaden the target."
+  short_description: "Compress one Claude session and preserve its working knowledge."
+  default_prompt: "Use $claude-jsonl-compressor for model-assisted compression of one Claude Code JSONL. Follow the last-prompt chain, exclude rewound branches, preserve the final title and requested recent turns, and validate the result."
 
 policy:
   allow_implicit_invocation: true

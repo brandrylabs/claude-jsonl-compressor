@@ -82,7 +82,7 @@ class TestBasicCompression(CompressBase):
         self.assertEqual(v["tool_pair_error_count"], 0)
         self.assertEqual(v["compact_boundary_count"], 1)
         self.assertEqual(v["compact_summary_count"], 1)
-        self.assertEqual(report["package_version"], "1.1.0")
+        self.assertEqual(report["package_version"], "1.2.0")
         self.assertEqual(report["codex_offline_compression_version"], "v10")
         self.assertEqual(report["model_pack_schema_version"], 11)
         self.assertEqual(report["report_schema_version"], 1)
@@ -3129,7 +3129,10 @@ class TestTransactionalWrites(CompressBase):
 
     def test_candidate_publication_does_not_require_hardlinks(self):
         session_id = "a2a2a2a2-a2a2-a2a2-a2a2-a2a2a2a2a2a2"
-        records = fx.build_linear(session_id, turns=20).records
+        source = fx.write_jsonl(self.tmp / "source.jsonl", fx.build_linear(session_id, turns=20).records)
+        generated = self.tmp / "generated.jsonl"
+        ccj.compress_jsonl(source, generated, .05, 2, 8000, deterministic_summary=True)
+        records = fx.read_jsonl(generated)
         destination = self.tmp / "candidate-output.jsonl"
 
         with mock.patch.object(ccj.os, "link", side_effect=OSError("hard links unavailable")):
@@ -3557,7 +3560,9 @@ class TestSessionTools(unittest.TestCase):
     def test_find_by_title_hint(self):
         with self.assertRaises(FileNotFoundError):
             cst.find_unique_session(self.tmp / "projects", "feasibility")
-        found = cst.find_unique_session(self.tmp / "projects", "feasibility", scan_titles=True)
+        with self.assertRaisesRegex(RuntimeError, "partial title"):
+            cst.find_unique_session(self.tmp / "projects", "feasibility", scan_titles=True)
+        found = cst.find_unique_session(self.tmp / "projects", "Legal feasibility research", scan_titles=True)
         self.assertEqual(found.resolve(), self.session_file.resolve())
 
     def test_numbered_backups_increment(self):

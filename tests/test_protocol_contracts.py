@@ -238,11 +238,15 @@ class TestSemanticProtocolContracts(ProtocolBase):
         tb.last_prompt()
         source = fx.write_jsonl(self.tmp / "compact-turn.jsonl", tb.records)
         result = ccj.preflight_jsonl(source, .05, 2, 12000, min_recent_turns=50)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["state"], "insufficient-recent-turns")
+        self.assertEqual(result["partition"]["availableRecentTurns"], 3)
+        result = ccj.preflight_jsonl(source, .05, 2, 12000, min_recent_turns=3)
         self.assertTrue(result["ok"], result)
         self.assertEqual(result["partition"]["availableRecentTurns"], 3)
         self.assertEqual(result["partition"]["rawHumanMessages"], 3)
         # All available post-compact turns remain raw; the prior compact is summarized.
-        pack = ccj.build_model_summary_pack_for_input(source, .05, 2, 12000, min_recent_turns=50)
+        pack = ccj.build_model_summary_pack_for_input(source, .05, 2, 12000, min_recent_turns=3)
         self.assertEqual(pack["prior_summary_count"], 1)
 
     def test_exact_locator_wins_over_title_and_invalid_title_does_not_replace_name(self):

@@ -437,7 +437,7 @@ def publish_repair_candidate(
         validation = validate_repair(source_bytes, published_bytes, plan)
         if not validation.get("ok"):
             raise ValueError(f"published repair candidate validation failed: {validation.get('errors')}")
-        full_validation = ccj.validate_jsonl_bytes(published_bytes, source_label=path.name)
+        full_validation = ccj.validate_jsonl_bytes(published_bytes, source_label=path.name, contract="historical-source")
         validation["fullTranscriptValidation"] = full_validation
         if not full_validation.get("ok"):
             raise ValueError(
@@ -524,6 +524,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ):
             if process_path is not None and ccj.is_under_claude_root(process_path):
                 raise ValueError(f"{label} process files must be outside the entire .claude directory")
+        candidate_role = (args.work_dir / f"{args.input.stem}.read-pages-repaired.jsonl"
+                          if args.replace_original else args.output)
+        roles = dict(work=args.work_dir, backup_dir=args.backup_dir,
+                     backup=ccj.numbered_backup_path(args.input, args.backup_dir) if args.replace_original else None)
+        ccj.guard_artifact_roles(args.input, candidate_role, sidecars=(".repair.json",), **roles)
         source_bytes = args.input.read_bytes()
         plan = plan_read_pages_repairs(source_bytes, scope=args.scope, resume_leaf_override=args.resume_leaf)
         if args.expect_matches is not None and plan["patchableMatchCount"] != args.expect_matches:
@@ -537,7 +542,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         validation = validate_repair(source_bytes, output_bytes, plan)
         if not validation.get("ok"):
             raise ValueError(f"repair validation failed: {validation.get('errors')}")
-        full_validation = ccj.validate_jsonl_bytes(output_bytes, source_label=args.input.name)
+        full_validation = ccj.validate_jsonl_bytes(output_bytes, source_label=args.input.name, contract="historical-source")
         validation["fullTranscriptValidation"] = full_validation
         if not full_validation.get("ok"):
             raise ValueError(
@@ -556,6 +561,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             output_path = args.work_dir / f"{args.input.stem}.read-pages-repaired.jsonl"
         else:
             output_path = args.output
+        ccj.guard_artifact_roles(args.input, output_path, sidecars=(".repair.json",), **roles)
         validation = publish_repair_candidate(output_path, source_bytes, output_bytes, plan)
         report = {
             "packageVersion": ccj.PACKAGE_VERSION,
@@ -574,6 +580,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 backup_dir=args.backup_dir,
                 expected_source_sha256=plan["sourceSha256"],
                 expected_candidate_sha256=validation["outputSha256"],
+                validation_contract="historical-source",
             )
             backup = replacement["backup_path"]
             report["replacementTarget"] = ccj.public_path_label(args.input)
@@ -586,6 +593,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             report["replacementCleanupErrors"] = replacement["cleanup_errors"]
         report_path = output_path.with_suffix(output_path.suffix + ".repair.json")
         try:
+            ccj.guard_artifact_roles(args.input, output_path, sidecars=(".repair.json",), **roles)
             ccj.atomic_write_text(report_path, json.dumps(report, ensure_ascii=False, indent=2) + "\n")
         except Exception as report_exc:
             if replacing:

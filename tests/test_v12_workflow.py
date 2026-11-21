@@ -108,6 +108,43 @@ class TestV12Workflow(unittest.TestCase):
             self.assertGreaterEqual(report["cost"]["requestsByStage"]["reduce"],1)
             self.assertTrue(core.validate_jsonl(run/"candidate.jsonl",contract="fresh-candidate")["ok"])
 
+    def test_partition_takes_the_longest_fitting_prefix(self):
+        shared = {"shared": "Shared source text. " * 50}
+        units = []
+        for i in range(110):
+            text = f"Item {i}. " + "原文 and notes " * (1 + i % 6)
+            units.append(dict(id=f"E{i}", text=text, support=text, lines=[i],
+                              refs=["shared"] if i % 3 else [], residuals={},
+                              index=f"Quoted passage {i}" if i % 5 == 0 else ""))
+        for stage in ("map", "reduce"):
+            def size(group):
+                return core.estimate_tokens(ev.request_for(group, shared, stage)[0])
+
+            exact = size(units[:41])
+            for cap in (size(units), exact, exact - 1, size(units[:13])):
+                with self.subTest(stage=stage, cap=cap):
+                    windows = ev.partition(core, iter(units), shared, cap, stage)
+                    self.assertEqual([unit for window in windows for unit in window], units)
+                    consumed = 0
+                    for window in windows:
+                        self.assertLessEqual(size(window), cap)
+                        consumed += len(window)
+                        if consumed < len(units):
+                            self.assertGreater(size(window + [units[consumed]]), cap)
+                    if cap == exact:
+                        self.assertEqual(windows[0], units[:41])
+
+    def test_partition_preserves_the_migration_output_allowance(self):
+        text = "Preserve this source passage."
+        reserve = 40 + core.estimate_tokens(text)
+        units = [dict(id=f"E{i}", text="", support="", lines=[i], refs=[],
+                      residuals={f"P1R{i}": text}) for i in range(7)]
+        cap = core.estimate_tokens(ev.request_for(units, {}, "map")[0])
+        windows = ev.partition(core, units, {}, cap, "map", output=4 * reserve)
+        self.assertEqual(windows, [units[:2], units[2:4], units[4:6], units[6:]])
+        with self.assertRaisesRegex(ValueError, "atomic migration obligation"):
+            ev.partition(core, units, {}, cap, "map", output=2 * reserve - 1)
+
     def test_budget_and_media_boundaries(self):
         with self.assertRaises(ValueError):ev.profile(372000,300000,60000,32000,32000,2000,1000,3)
         p=ev.profile(36000,32000,2000,3000,8000,1000,1000,3)

@@ -5,7 +5,7 @@ description: Compress one Claude Code JSONL using a source-anchored model summar
 
 # Claude JSONL Compressor
 
-Package **1.2.1**, engine **v10**, legacy model-pack **v11**, report **1**. The `v12` workflow writes a compact working memory and stores its audit in a private run directory.
+Package **1.2.2**, engine **v10**, legacy model-pack **v11**, report **1**. The `v12` workflow writes a compact working memory and stores its audit in a private run directory.
 
 Reduce Claude context/cache costs while preserving the user's required history.
 Operate on exactly one authoritative JSONL. Never merge sessions or revive
@@ -34,7 +34,7 @@ the user explicitly requests it.
 
 ## Research and repeated compression with v12
 
-For an ordinary Codex compression request, choose the v12 workflow. If the caller explicitly requests the legacy two-pass workflow, use its instructions below. Run `compress_claude_jsonl.py v12 plan` with the unique source, target budget, recent-history requirements and prior-summary policy. Repeat the settings with `v12 prepare`. Its default run directory is per user and outside the Claude configuration root. A supplied run directory must be new. Prepare verifies a numbered source backup and prints the request paths. Preserve an explicit no-rewrite request with `--prior verbatim-locked`; `clean-and-merge` needs permission to reorganize prior text. The v12 default is `resynthesize`.
+For an ordinary Codex compression request, choose the v12 workflow. If the caller explicitly requests the legacy two-pass workflow, use its instructions below. Run `compress_claude_jsonl.py v12 plan` with the unique source, target budget, recent-history requirements and prior-summary policy. Choose the per-task budget from the available context and the material, honoring any user-specified input limit. Prefer one writing task when it fits and large contiguous sections otherwise. Set the final session target independently. Repeat the settings with `v12 prepare`. Its default run directory is per user and outside the Claude configuration root. A supplied run directory must be new. Prepare verifies a numbered source backup and prints the request paths. Preserve an explicit no-rewrite request with `--prior verbatim-locked`; `clean-and-merge` needs permission to reorganize prior text. The v12 default is `resynthesize`.
 
 Read the assigned request in each isolated writing context. Keep the decisions, reasons, results, relevant source wording and open questions for the next task. Where the evidence includes a revised figure, keep its earlier value, unit and condition. Where permission matters, keep its speaker and scope. Use the supplied locked references for corrections and record any relevant gaps in the material read. Compact models use the same short Markdown protocol. Submit each complete draft, reconcile multiple Maps in Reduce, and run `v12 finish` to produce the verified candidate in the run directory. When the user requests replacement of a confirmed closed project session, use live preparation and finish with replacement. Report the actual outcome, estimated size, retained turns and available file snapshots, and the verified backup or output path. For a standalone export, deliver the validated output separately. Ask the user to inspect a file only when they request a manual review.
 

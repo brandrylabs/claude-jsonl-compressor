@@ -330,7 +330,7 @@ class TestV12Workflow(unittest.TestCase):
                 self.assertEqual(receipt["operation"], "committed-report-failed")
                 self.assertEqual(src.read_bytes(), candidate)
                 backup = Path(receipt["backup"])
-                self.assertEqual(list(project.glob("*.backup*")), [backup])
+                self.assertEqual(list(project.resolve(strict=True).glob("*.backup*")), [backup])
                 self.assertEqual(backup.read_bytes(), original)
                 self.assertEqual(receipt["candidateSha256"], core.file_sha256(src))
                 self.assertEqual(receipt["sourceSha256"], core.file_sha256(backup))

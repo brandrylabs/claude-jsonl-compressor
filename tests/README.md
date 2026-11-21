@@ -8,6 +8,8 @@ tarball offline.
 
 ## Run
 
+The 1.2.0 suite also exercises v12 planning, the Map/Reduce source chain, verbatim retention and migration, literal excerpts, compact-model draft validation, numbered backup reuse and committed recovery receipts. The legacy v11 workflow uses the same default settings.
+
 From the project root on Windows:
 
 ```powershell

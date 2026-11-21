@@ -34,7 +34,7 @@ function runPython(scriptName) {
     const selected = options[index];
     const child = spawn(
       selected.command,
-      [...selected.prefix, "-B", scriptPath, ...process.argv.slice(2)],
+      [...selected.prefix, "-X", "utf8", "-B", scriptPath, ...process.argv.slice(2)],
       { shell: false, stdio: "inherit", windowsHide: true }
     );
     let started = false;

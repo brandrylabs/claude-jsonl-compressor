@@ -405,19 +405,16 @@ def migration_units(core, entries, cap):
 
 
 def partition(core, entries, pool, cap, stage, output=None):
-    windows, pending, size, refs = [], [], 0, set()
+    pages, batch_ends, receipt_totals = [], [], [0]
+    batch_start, size, refs = 0, 0, set()
     header = core.estimate_tokens(request_for([], {}, stage)[0]) + 12
-    def flush():
-        if pending:
-            windows.append(list(pending))
-            pending.clear()
-    receipt_reserve = 0
+    # Use the cheap estimate to bound exact probes on long histories.
     for item in entries:
         own_cost = core.estimate_tokens(request_for([item], pool, stage)[0])
         if stage == "reduce" and own_cost > cap:
             check_reduce_size(core, item, cap)
-        pages = [item] if own_cost <= cap else page_unit(core, item, pool, cap, stage)
-        for page in pages:
+        item_pages = [item] if own_cost <= cap else page_unit(core, item, pool, cap, stage)
+        for page in item_pages:
             cost = core.estimate_tokens(request_for([dict(page, refs=[])], {}, stage)[0]) - header + 20
             new_refs = set(page["refs"]).difference(refs)
             extra = sum(core.estimate_tokens(pool[k]) + 25 for k in new_refs)
@@ -426,29 +423,45 @@ def partition(core, entries, pool, cap, stage, output=None):
                           for value in page["residuals"].values())
             if output and receipt > output // 2:
                 raise ValueError("generation allowance cannot accommodate this atomic migration obligation")
-            if pending and (size + header + cost + extra > cap
-                            or output and receipt_reserve + receipt > output // 2):
-                flush()
-                size, refs, receipt_reserve = 0, set(), 0
+            batch_receipt = receipt_totals[-1] - receipt_totals[batch_start] + receipt
+            if len(pages) > batch_start and (size + header + cost + extra > cap
+                                             or (output and batch_receipt > output // 2)):
+                batch_start = len(pages)
+                batch_ends.append(batch_start)
+                size, refs = 0, set()
                 extra = sum(core.estimate_tokens(pool[k]) + 25 for k in page["refs"])
-            pending.append(page)
-            receipt_reserve += receipt
+            pages.append(page)
+            receipt_totals.append(receipt_totals[-1] + receipt)
             refs.update(page["refs"])
             size += cost + extra
-    flush()
-    # Enforce the exact rendering limit even when the incremental estimate rounds down.
+    if not pages:
+        return []
+    batch_ends.append(len(pages))
+
+    def fits(start, stop):
+        if output and receipt_totals[stop] - receipt_totals[start] > output // 2:
+            return False
+        request = request_for(pages[start:stop], pool, stage)[0]
+        return core.estimate_tokens(request) <= cap
+
     result = []
-    def fit(group):
-        if core.estimate_tokens(request_for(group, pool, stage)[0]) <= cap:
-            result.append(group)
-        elif len(group) > 1:
-            n = len(group)//2
-            fit(group[:n])
-            fit(group[n:])
-        else:
-            raise ValueError("a rendered request exceeds its frozen profile")
-    for w in windows:
-        fit(w)
+    start = fitted = 0
+    for stop in batch_ends:
+        while not fits(start, stop):
+            # Extending an ordered prefix only adds evidence and receipt obligations.
+            low, high = fitted, stop - 1
+            while low < high:
+                mid = (low + high + 1) // 2
+                if fits(start, mid):
+                    low = mid
+                else:
+                    high = mid - 1
+            if low == start:
+                raise ValueError("a rendered request exceeds its frozen profile")
+            result.append(pages[start:low])
+            start = fitted = low
+        fitted = stop
+    result.append(pages[start:])
     return result
 
 

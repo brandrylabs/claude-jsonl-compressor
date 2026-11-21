@@ -182,7 +182,7 @@ class TestNpmPackage(unittest.TestCase):
     def test_manifest_has_no_runtime_dependencies_or_install_hooks(self):
         manifest = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["name"], "@brandry/claude-jsonl-compressor")
-        self.assertEqual(manifest["version"], "1.2.1")
+        self.assertEqual(manifest["version"], "1.2.2")
         self.assertEqual(manifest["publishConfig"]["tag"], "latest")
         self.assertEqual(manifest["license"], "GPL-3.0-only")
         self.assertEqual(manifest["engines"]["node"], ">=22")
@@ -356,7 +356,7 @@ class TestNpmPackage(unittest.TestCase):
         self.assertEqual(json.loads(node_version.stdout), json.loads(python_version.stdout))
         self.assertEqual(json.loads(python_version.stdout)["defaultModelPackEstimatedTokenBudget"], 150000)
         repair_data = json.loads(repair_version.stdout)
-        self.assertEqual(repair_data["packageVersion"], "1.2.1")
+        self.assertEqual(repair_data["packageVersion"], "1.2.2")
         self.assertEqual(repair_data["engineVersion"], "v10")
         self.assertEqual(repair_data["reportSchemaVersion"], 1)
 
@@ -365,7 +365,7 @@ class TestNpmPackage(unittest.TestCase):
             result = run(sys.executable, "-B", "-I", "-S", str(ROOT / "scripts" / script), "--version")
             self.assertEqual(result.returncode, 0, result.stderr)
             data = json.loads(result.stdout)
-            self.assertEqual(data["packageVersion"], "1.2.1")
+            self.assertEqual(data["packageVersion"], "1.2.2")
             self.assertEqual(data["engineVersion"], "v10")
 
     def test_real_npm_tarball_matches_public_allowlist_and_installs_offline(self):
@@ -434,7 +434,7 @@ class TestNpmPackage(unittest.TestCase):
                 else:
                     invoked = run(str(executable), "--version", cwd=tmp)
                 self.assertEqual(invoked.returncode, 0, invoked.stderr)
-                self.assertEqual(json.loads(invoked.stdout)["packageVersion"], "1.2.1")
+                self.assertEqual(json.loads(invoked.stdout)["packageVersion"], "1.2.2")
 
 
 if __name__ == "__main__":

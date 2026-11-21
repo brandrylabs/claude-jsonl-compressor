@@ -4,6 +4,12 @@ Notable public changes are recorded here. This project follows Semantic Versioni
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-11-21
+
+### Fixed
+
+- Keep evidence in a single writing task when the rendered request fits. Longer histories and merged drafts use the largest consecutive sections that fit the input budget and the required output allowance.
+
 ## [1.2.1] - 2026-11-21
 
 ### Changed
@@ -91,7 +97,8 @@ Initial public release candidate.
 - Live replacement handles one closed session at a time and requires Python 3.10 or newer.
 - Parent-directory durability is best effort where the platform does not support directory fsync.
 
-[Unreleased]: https://github.com/brandrylabs/claude-jsonl-compressor/compare/v1.2.1...HEAD
+[Unreleased]: https://github.com/brandrylabs/claude-jsonl-compressor/compare/v1.2.2...HEAD
+[1.2.2]: https://github.com/brandrylabs/claude-jsonl-compressor/releases/tag/v1.2.2
 [1.2.1]: https://github.com/brandrylabs/claude-jsonl-compressor/releases/tag/v1.2.1
 [1.2.0]: https://github.com/brandrylabs/claude-jsonl-compressor/releases/tag/v1.2.0
 [1.1.0]: https://github.com/brandrylabs/claude-jsonl-compressor/releases/tag/v1.1.0

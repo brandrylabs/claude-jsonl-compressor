@@ -1,6 +1,6 @@
 {
   "name": "@brandry/claude-jsonl-compressor",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Strict, model-assisted compression and byte-preserving compatibility repair for one Claude Code JSONL session.",
   "keywords": [
     "claude-code",

@@ -1,10 +1,18 @@
 # v12 commands and private run files
 
-Version 1.2.0 adds the `v12` subcommand to the Python and npm compression entry points. The Python scripts use the standard library. A writing model supplies the semantic drafts.
+Codex uses the `v12` subcommand internally for ordinary compression requests. It is also available through the Python and npm command-line entry points. The Python scripts use the standard library. A writing model supplies the semantic drafts.
 
 ## Plan and freeze
 
 Run `v12 plan --input FILE` with the selected budget, recent record/turn minimums and prior policy. Use `v12 prepare` with the same options. Add `--run NEW_DIRECTORY` to choose the destination or take the run path printed by prepare. The default is a per-user persistent runs directory under LocalAppData, XDG state, or Application Support. Both the configured `CLAUDE_CONFIG_DIR` and directories named `.claude` receive live-tree protection.
+
+A standalone-file example targets 100,000 estimated tokens and sets a floor of three recent raw records. The active branch and complete tool exchanges determine how many records actually stay. Use a new run directory.
+
+```powershell
+claude-jsonl-compressor v12 plan --input "C:\data\session.jsonl" --min-recent-records 3 --target-estimated-tokens 100000
+claude-jsonl-compressor v12 prepare --input "C:\data\session.jsonl" --min-recent-records 3 --target-estimated-tokens 100000 --run "C:\work\first-run"
+claude-jsonl-compressor v12 status --run "C:\work\first-run"
+```
 
 Prepare freezes the source digest, identity, selection, policy, implementation fingerprint, budgets and request digests. It creates and verifies an independent numbered backup beside the source. Supply `--backup-dir DIRECTORY` for an external backup, including a read-only source directory. All request, audit and recovery files contain private material and belong in the run directory.
 

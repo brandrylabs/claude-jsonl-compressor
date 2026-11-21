@@ -4,6 +4,13 @@ Notable public changes are recorded here. This project follows Semantic Versioni
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-11-21
+
+### Changed
+
+- Ask Codex to compress a Claude session by file path or final title. The English, Chinese and Japanese examples show how to set a target size, choose how much rewind history to keep and request a verified replacement.
+- Describe compression choices in everyday language. Codex selects the section-based workflow for ordinary requests and reports the result and backup or output location.
+
 ## [1.2.0] - 2026-11-21
 
 ### Added
@@ -84,7 +91,8 @@ Initial public release candidate.
 - Live replacement handles one closed session at a time and requires Python 3.10 or newer.
 - Parent-directory durability is best effort where the platform does not support directory fsync.
 
-[Unreleased]: https://github.com/brandrylabs/claude-jsonl-compressor/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/brandrylabs/claude-jsonl-compressor/compare/v1.2.1...HEAD
+[1.2.1]: https://github.com/brandrylabs/claude-jsonl-compressor/releases/tag/v1.2.1
 [1.2.0]: https://github.com/brandrylabs/claude-jsonl-compressor/releases/tag/v1.2.0
 [1.1.0]: https://github.com/brandrylabs/claude-jsonl-compressor/releases/tag/v1.1.0
 [1.0.0]: https://github.com/brandrylabs/claude-jsonl-compressor/releases/tag/v1.0.0

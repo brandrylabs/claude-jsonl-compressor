@@ -39,7 +39,7 @@ title_value = _session_tools.title_value
 
 
 JsonObj = Dict[str, Any]
-PACKAGE_VERSION = "1.2.0"
+PACKAGE_VERSION = "1.2.1"
 CODEX_OFFLINE_COMPRESSION_VERSION = "v10"
 MODEL_PACK_SCHEMA_VERSION = 11
 REPORT_SCHEMA_VERSION = 1

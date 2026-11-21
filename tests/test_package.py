@@ -182,7 +182,7 @@ class TestNpmPackage(unittest.TestCase):
     def test_manifest_has_no_runtime_dependencies_or_install_hooks(self):
         manifest = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["name"], "@brandry/claude-jsonl-compressor")
-        self.assertEqual(manifest["version"], "1.2.0")
+        self.assertEqual(manifest["version"], "1.2.1")
         self.assertEqual(manifest["publishConfig"]["tag"], "latest")
         self.assertEqual(manifest["license"], "GPL-3.0-only")
         self.assertEqual(manifest["engines"]["node"], ">=22")
@@ -245,7 +245,6 @@ class TestNpmPackage(unittest.TestCase):
 
     def test_public_guidance_uses_current_model_pack_schema(self):
         for relative in (
-            "README.md",
             "SKILL.md",
             "references/claude-jsonl-compression-format.md",
             "tests/README.md",
@@ -254,7 +253,6 @@ class TestNpmPackage(unittest.TestCase):
             self.assertIn("v11", text, relative)
             self.assertNotIn("v9", text, relative)
         for relative in (
-            "README.md",
             "SKILL.md",
             "references/claude-jsonl-compression-format.md",
             "tests/README.md",
@@ -274,10 +272,18 @@ class TestNpmPackage(unittest.TestCase):
             for block in model_passes:
                 self.assertIn("--target-estimated-tokens 150000", block, relative)
 
-    def test_release_guidance_separates_local_publish_from_ci_provenance(self):
+    def test_codex_templates_and_linked_command_reference(self):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn("v12 prepare", readme)
-        self.assertIn("v12 finish", readme)
+        for name in ("README.md", "docs/README.zh-CN.md", "docs/README.ja.md"):
+            guide = (ROOT / name).read_text(encoding="utf-8")
+            prompts = re.findall(r"^```text\n(.*?)\n```$", guide, re.MULTILINE | re.DOTALL)
+            self.assertEqual(len(prompts), 1, name)
+            for term in ("claude-jsonl-compressor", ".jsonl", "/rewind"):
+                self.assertIn(term, prompts[0], name)
+            self.assertNotRegex(prompts[0], r"\bv(?:11|12)\b", name)
+        reference = (ROOT / "references/v12-workflow.md").read_text(encoding="utf-8")
+        for action in ("plan", "prepare", "status", "submit", "finish"):
+            self.assertIn("claude-jsonl-compressor v12 " + action, reference)
         for process_doc in ("references/v12-workflow.md", "references/v12-memory.md", "SKILL.md"):
             self.assertTrue((ROOT / process_doc).is_file())
             self.assertIn(process_doc, readme)
@@ -350,7 +356,7 @@ class TestNpmPackage(unittest.TestCase):
         self.assertEqual(json.loads(node_version.stdout), json.loads(python_version.stdout))
         self.assertEqual(json.loads(python_version.stdout)["defaultModelPackEstimatedTokenBudget"], 150000)
         repair_data = json.loads(repair_version.stdout)
-        self.assertEqual(repair_data["packageVersion"], "1.2.0")
+        self.assertEqual(repair_data["packageVersion"], "1.2.1")
         self.assertEqual(repair_data["engineVersion"], "v10")
         self.assertEqual(repair_data["reportSchemaVersion"], 1)
 
@@ -359,7 +365,7 @@ class TestNpmPackage(unittest.TestCase):
             result = run(sys.executable, "-B", "-I", "-S", str(ROOT / "scripts" / script), "--version")
             self.assertEqual(result.returncode, 0, result.stderr)
             data = json.loads(result.stdout)
-            self.assertEqual(data["packageVersion"], "1.2.0")
+            self.assertEqual(data["packageVersion"], "1.2.1")
             self.assertEqual(data["engineVersion"], "v10")
 
     def test_real_npm_tarball_matches_public_allowlist_and_installs_offline(self):
@@ -428,7 +434,7 @@ class TestNpmPackage(unittest.TestCase):
                 else:
                     invoked = run(str(executable), "--version", cwd=tmp)
                 self.assertEqual(invoked.returncode, 0, invoked.stderr)
-                self.assertEqual(json.loads(invoked.stdout)["packageVersion"], "1.2.0")
+                self.assertEqual(json.loads(invoked.stdout)["packageVersion"], "1.2.1")
 
 
 if __name__ == "__main__":

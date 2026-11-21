@@ -5,7 +5,7 @@ description: Compress one Claude Code JSONL using a source-anchored model summar
 
 # Claude JSONL Compressor
 
-Package **1.2.0**, engine **v10**, legacy model-pack **v11**, report **1**. The explicit `v12` command writes a compact working memory and stores its audit in a private run directory.
+Package **1.2.1**, engine **v10**, legacy model-pack **v11**, report **1**. The `v12` workflow writes a compact working memory and stores its audit in a private run directory.
 
 Reduce Claude context/cache costs while preserving the user's required history.
 Operate on exactly one authoritative JSONL. Never merge sessions or revive
@@ -34,9 +34,9 @@ the user explicitly requests it.
 
 ## Research and repeated compression with v12
 
-For requests to use v12, use `compress_claude_jsonl.py v12 plan` with the exact source, final budget, minimum recent turns and desired prior policy. Repeat the settings with `v12 prepare`. Its default run directory is per user and outside the Claude configuration root. A supplied run directory must be new. Prepare verifies a numbered source backup and prints the request paths. Preserve an explicit no-rewrite request with `--prior verbatim-locked`; `clean-and-merge` needs permission to reorganize prior text. The v12 default is `resynthesize`.
+For an ordinary Codex compression request, choose the v12 workflow. If the caller explicitly requests the legacy two-pass workflow, use its instructions below. Run `compress_claude_jsonl.py v12 plan` with the unique source, target budget, recent-history requirements and prior-summary policy. Repeat the settings with `v12 prepare`. Its default run directory is per user and outside the Claude configuration root. A supplied run directory must be new. Prepare verifies a numbered source backup and prints the request paths. Preserve an explicit no-rewrite request with `--prior verbatim-locked`; `clean-and-merge` needs permission to reorganize prior text. The v12 default is `resynthesize`.
 
-Read the assigned request in each isolated writing context. Keep the earlier number, revision, unit and condition together. Name the speaker and scope of an authorization. Use the supplied locked references for a correction to prior text. Preserve decisions, rationale, results, source wording and unread ranges. Compact models use the same short Markdown protocol. Submit each complete draft, reconcile multiple Maps in Reduce, and run `v12 finish` to produce the verified candidate in the run directory. Include the facts needed to continue work and identify any original material that still needs to be read.
+Read the assigned request in each isolated writing context. Keep the decisions, reasons, results, relevant source wording and open questions for the next task. Where the evidence includes a revised figure, keep its earlier value, unit and condition. Where permission matters, keep its speaker and scope. Use the supplied locked references for corrections and record any relevant gaps in the material read. Compact models use the same short Markdown protocol. Submit each complete draft, reconcile multiple Maps in Reduce, and run `v12 finish` to produce the verified candidate in the run directory. When the user requests replacement of a confirmed closed project session, use live preparation and finish with replacement. Report the actual outcome, estimated size, retained turns and available file snapshots, and the verified backup or output path. For a standalone export, deliver the validated output separately. Ask the user to inspect a file only when they request a manual review.
 
 Use [v12 workflow](references/v12-workflow.md) for commands, profiles, recovery and live installation. Read [v12 memory](references/v12-memory.md) when writing or reviewing a draft. The remaining two-pass instructions cover the compatible v11 entry.
 
